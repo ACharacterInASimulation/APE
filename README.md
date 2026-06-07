@@ -123,14 +123,14 @@ scripts/run_ape_eval_suite.sh \
   --litm-dir data/litm_nq
 
 scripts/run_scratchpad_eval_suite.sh \
-  --checkpoint outputs/scratchpad_multihop_qwen3_1_7b \
   --input-jsonl data/scratchpad_multihop/eval.jsonl \
-  --litm-dir data/litm_nq
+  --litm-dir data/litm_nq \
+  --train-batch-size 4
 ```
 
-`run_ape_eval_suite.sh` runs `ape_scaled`, `ape_scaled_pos64`, `ape_scaled_pos128`, `ape_scaled_pos512`, and `decoder` on CUDA device 2 by default. The decoder gets LITM `start,middle,end`; APE methods use the representative `--parallel-litm-positions start`.
+`run_ape_eval_suite.sh` launches `ape_scaled`, `ape_scaled_pos64`, `ape_scaled_pos128`, `ape_scaled_pos512`, and `decoder` in parallel on CUDA device 2 by default. LITM defaults to 1000 examples from the 20-document files; decoder gets `start,middle,end`, while APE methods use the representative `--parallel-litm-positions start`; multi-hop defaults to `as_is` order.
 
-`run_scratchpad_eval_suite.sh` runs `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512` from the trained checkpoint on CUDA device 3 by default, with multi-hop `as_is` and representative LITM by default. Both wrappers check that the requested LITM files are present before eval starts.
+`run_scratchpad_eval_suite.sh` trains the scratchpad checkpoint first when the configured checkpoint is missing, then runs `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512` on CUDA device 3 by default. Pass `--train-batch-size 4` to try batch size 4, `--checkpoint PATH` to choose the train/eval checkpoint path, `--skip-train` to require an existing checkpoint, or `--force-train` to retrain before eval. Both wrappers check that the requested LITM files are present before eval starts.
 
 ## TODOs
 We will release the code and data in the following order, please stay tuned!

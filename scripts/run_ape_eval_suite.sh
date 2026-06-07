@@ -9,11 +9,11 @@ OUTPUT_DIR="outputs/eval_suites/ape_decoder_${RUN_ID}"
 BASE_MODEL=""
 DECODER_CHECKPOINT=""
 MAX_EXAMPLES=""
-LIMIT_PER_LITM_FILE=""
-LITM_DOC_COUNTS="10,20,30"
+LIMIT_PER_LITM_FILE="1000"
+LITM_DOC_COUNTS="20"
 LITM_POSITIONS="start,middle,end"
 PARALLEL_LITM_POSITIONS="start"
-ORDER_VARIANTS="as_is,gold_start,gold_middle,gold_end"
+ORDER_VARIANTS="as_is"
 MAX_NEW_TOKENS=""
 MAX_CONTEXT_TOKENS=""
 APE_TEMPERATURE=""
@@ -70,7 +70,7 @@ Runs:
   - ape_scaled_pos64 on LITM representative position + multi-hop as-is
   - ape_scaled_pos128 on LITM representative position + multi-hop as-is
   - ape_scaled_pos512 on LITM representative position + multi-hop as-is
-  - decoder on LITM start/middle/end + multi-hop order variants
+  - decoder on LITM start/middle/end + multi-hop as-is
 
 Options:
   --config PATH
@@ -80,11 +80,11 @@ Options:
   --litm-dir DIR
   --output-dir DIR
   --max-examples N
-  --limit-per-litm-file N
-  --litm-doc-counts CSV          default: 10,20,30
+  --limit-per-litm-file N        default: 1000
+  --litm-doc-counts CSV          default: 20
   --litm-positions CSV           default: start,middle,end
   --parallel-litm-positions CSV  default: start
-  --order-variants CSV           default: as_is,gold_start,gold_middle,gold_end
+  --order-variants CSV           default: as_is
   --max-new-tokens N
   --max-context-tokens N
   --ape-temperature FLOAT
@@ -133,35 +133,86 @@ check_litm_files
 
 mkdir -p "$OUTPUT_DIR"
 
-cmd=(
+common_args=(
   python scripts/eval_scratchpad.py
   --config "$CONFIG"
-  --methods "ape_scaled,ape_scaled_pos64,ape_scaled_pos128,ape_scaled_pos512,decoder"
   --input-jsonl "$INPUT_JSONL"
   --litm-dir "$LITM_DIR"
-  --output-jsonl "$OUTPUT_DIR/predictions.jsonl"
-  --metrics-json "$OUTPUT_DIR/metrics.json"
   --litm-doc-counts "$LITM_DOC_COUNTS"
   --litm-positions "$LITM_POSITIONS"
   --parallel-litm-positions "$PARALLEL_LITM_POSITIONS"
   --order-variants "$ORDER_VARIANTS"
 )
 
-[[ -n "$BASE_MODEL" ]] && cmd+=(--base-model "$BASE_MODEL")
-[[ -n "$DECODER_CHECKPOINT" ]] && cmd+=(--decoder-checkpoint "$DECODER_CHECKPOINT")
-[[ -n "$MAX_EXAMPLES" ]] && cmd+=(--max-examples "$MAX_EXAMPLES")
-[[ -n "$LIMIT_PER_LITM_FILE" ]] && cmd+=(--limit-per-litm-file "$LIMIT_PER_LITM_FILE")
-[[ -n "$MAX_NEW_TOKENS" ]] && cmd+=(--max-new-tokens "$MAX_NEW_TOKENS")
-[[ -n "$MAX_CONTEXT_TOKENS" ]] && cmd+=(--max-context-tokens "$MAX_CONTEXT_TOKENS")
-[[ -n "$APE_TEMPERATURE" ]] && cmd+=(--ape-temperature "$APE_TEMPERATURE")
-[[ -n "$APE_SCALE" ]] && cmd+=(--ape-scale "$APE_SCALE")
+[[ -n "$BASE_MODEL" ]] && common_args+=(--base-model "$BASE_MODEL")
+[[ -n "$DECODER_CHECKPOINT" ]] && common_args+=(--decoder-checkpoint "$DECODER_CHECKPOINT")
+[[ -n "$MAX_EXAMPLES" ]] && common_args+=(--max-examples "$MAX_EXAMPLES")
+[[ -n "$LIMIT_PER_LITM_FILE" ]] && common_args+=(--limit-per-litm-file "$LIMIT_PER_LITM_FILE")
+[[ -n "$MAX_NEW_TOKENS" ]] && common_args+=(--max-new-tokens "$MAX_NEW_TOKENS")
+[[ -n "$MAX_CONTEXT_TOKENS" ]] && common_args+=(--max-context-tokens "$MAX_CONTEXT_TOKENS")
+[[ -n "$APE_TEMPERATURE" ]] && common_args+=(--ape-temperature "$APE_TEMPERATURE")
+[[ -n "$APE_SCALE" ]] && common_args+=(--ape-scale "$APE_SCALE")
 
-printf 'Running: CUDA_VISIBLE_DEVICES=%q' "$CUDA_DEVICE"
-printf ' %q' "${cmd[@]}"
-printf '\n'
+methods=(ape_scaled ape_scaled_pos64 ape_scaled_pos128 ape_scaled_pos512 decoder)
+for method in "${methods[@]}"; do
+  method_cmd=(
+    "${common_args[@]}"
+    --methods "$method"
+    --output-jsonl "$OUTPUT_DIR/${method}.predictions.jsonl"
+    --metrics-json "$OUTPUT_DIR/${method}.metrics.json"
+  )
+  printf 'Planned: CUDA_VISIBLE_DEVICES=%q' "$CUDA_DEVICE"
+  printf ' %q' "${method_cmd[@]}"
+  printf '\n'
+done
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "${cmd[@]}"
+pids=()
+for method in "${methods[@]}"; do
+  method_cmd=(
+    "${common_args[@]}"
+    --methods "$method"
+    --output-jsonl "$OUTPUT_DIR/${method}.predictions.jsonl"
+    --metrics-json "$OUTPUT_DIR/${method}.metrics.json"
+  )
+  printf 'Launching %s on CUDA_VISIBLE_DEVICES=%q\n' "$method" "$CUDA_DEVICE"
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "${method_cmd[@]}" > "$OUTPUT_DIR/${method}.log" 2>&1 &
+  pids+=("$!")
+done
+
+failed=0
+for index in "${!pids[@]}"; do
+  if ! wait "${pids[$index]}"; then
+    echo "Method failed: ${methods[$index]} (see $OUTPUT_DIR/${methods[$index]}.log)" >&2
+    failed=1
+  fi
+done
+if [[ "$failed" -ne 0 ]]; then
+  exit 1
+fi
+
+python - "$OUTPUT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from scripts.eval_scratchpad import summarize
+
+out_dir = Path(sys.argv[1])
+rows = []
+for path in sorted(out_dir.glob("*.predictions.jsonl")):
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+with (out_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
+    for row in rows:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+with (out_dir / "metrics.json").open("w", encoding="utf-8") as handle:
+    json.dump(summarize(rows), handle, indent=2)
+print(f"combined predictions {out_dir / 'predictions.jsonl'}")
+print(f"combined metrics {out_dir / 'metrics.json'}")
+PY

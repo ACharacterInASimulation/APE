@@ -144,6 +144,7 @@ def main() -> None:
     parser.add_argument("--scratchpad-len", type=int, default=None)
     parser.add_argument("--max-seq-len", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--sparse-attention-backend", choices=["eager_block", "flash_block", "sdpa_mask", "dense"], default=None)
     parser.add_argument("--base-attn-implementation", default=None)
@@ -242,7 +243,7 @@ def main() -> None:
     training_args = make_training_arguments(
         output_dir=output_dir,
         overwrite_output_dir=bool(cfg_get(config, "train.overwrite_output_dir", False)),
-        per_device_train_batch_size=int(cfg_get(config, "train.batch_size", 1)),
+        per_device_train_batch_size=args.batch_size or int(cfg_get(config, "train.batch_size", 1)),
         per_device_eval_batch_size=int(cfg_get(config, "train.eval_batch_size", 1)),
         gradient_accumulation_steps=int(cfg_get(config, "train.grad_accum_steps", 8)),
         max_steps=args.max_steps or int(cfg_get(config, "train.max_steps", 12_500)),

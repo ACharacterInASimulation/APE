@@ -381,9 +381,12 @@ def main() -> None:
         temp = ape_temperature if scaled else 1.0
         scale = ape_scale if scaled else 1.0
         query_position_shift = method_position_shift(method)
-        for variant, example in tqdm(example_pairs, desc=method, dynamic_ncols=True):
-            if not should_evaluate_pair(method, variant, example, parallel_litm_positions):
-                continue
+        method_pairs = [
+            (variant, example)
+            for variant, example in example_pairs
+            if should_evaluate_pair(method, variant, example, parallel_litm_positions)
+        ]
+        for variant, example in tqdm(method_pairs, desc=method, dynamic_ncols=True):
             if method == "decoder":
                 prediction = generate_decoder(
                     model=model,

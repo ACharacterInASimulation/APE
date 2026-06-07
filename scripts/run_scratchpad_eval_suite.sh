@@ -8,6 +8,16 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="outputs/eval_suites/scratchpad_${RUN_ID}"
 BASE_MODEL=""
 CHECKPOINT=""
+TRAIN_JSONL=""
+TRAIN_EVAL_JSONL=""
+TRAIN_MAX_STEPS=""
+TRAIN_BATCH_SIZE=""
+TRAIN_MAX_EXAMPLES=""
+TRAIN_MAX_EVAL_EXAMPLES=""
+TRAIN_LEARNING_RATE=""
+TRAIN_SPARSE_BACKEND=""
+TRAIN_POSITION_STRATEGY=""
+TRAIN_QUESTION_POSITION_GAP=""
 MAX_EXAMPLES=""
 LIMIT_PER_LITM_FILE=""
 LITM_DOC_COUNTS="10,20,30"
@@ -18,7 +28,31 @@ MAX_CONTEXT_TOKENS=""
 APE_TEMPERATURE=""
 APE_SCALE=""
 CUDA_DEVICE="${CUDA_DEVICE:-3}"
+SKIP_TRAIN=0
+FORCE_TRAIN=0
 DRY_RUN=0
+
+config_value() {
+  python - "$CONFIG" "$1" "$2" <<'PY'
+import sys
+from pathlib import Path
+
+config_path, dotted, fallback = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    import yaml
+    with Path(config_path).open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+except Exception:
+    data = {}
+cur = data
+for part in dotted.split("."):
+    if not isinstance(cur, dict) or part not in cur:
+        print(fallback)
+        raise SystemExit
+    cur = cur[part]
+print(cur if cur is not None else fallback)
+PY
+}
 
 litm_gold_index() {
   case "$1:$2" in
@@ -62,9 +96,11 @@ check_litm_files() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run_scratchpad_eval_suite.sh --checkpoint PATH [options]
+Usage: scripts/run_scratchpad_eval_suite.sh [options]
 
-Runs trained scratchpad checkpoint variants:
+Trains the scratchpad model when the checkpoint is missing, then evaluates it.
+
+Evaluates trained scratchpad checkpoint variants:
   - scratchpad_noscale
   - scratchpad_scaled
   - scratchpad_scaled_pos512
@@ -73,7 +109,19 @@ Each method runs multi-hop as-is and the representative LITM position selected
 by --parallel-litm-positions.
 
 Options:
-  --checkpoint PATH              required unless CHECKPOINT env var is set
+  --checkpoint PATH              default: config output_dir
+  --skip-train                   require checkpoint and only run eval
+  --force-train                  train even if checkpoint already exists
+  --train-jsonl PATH
+  --train-eval-jsonl PATH
+  --train-max-steps N
+  --train-batch-size N
+  --train-max-examples N
+  --train-max-eval-examples N
+  --train-learning-rate FLOAT
+  --train-sparse-backend NAME    flash_block, sdpa_mask, eager_block, dense
+  --train-position-strategy NAME
+  --train-question-position-gap N
   --config PATH
   --base-model MODEL_OR_PATH
   --input-jsonl PATH
@@ -98,6 +146,18 @@ CHECKPOINT="${CHECKPOINT:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --checkpoint) CHECKPOINT="$2"; shift 2 ;;
+    --skip-train) SKIP_TRAIN=1; shift ;;
+    --force-train) FORCE_TRAIN=1; shift ;;
+    --train-jsonl) TRAIN_JSONL="$2"; shift 2 ;;
+    --train-eval-jsonl) TRAIN_EVAL_JSONL="$2"; shift 2 ;;
+    --train-max-steps) TRAIN_MAX_STEPS="$2"; shift 2 ;;
+    --train-batch-size) TRAIN_BATCH_SIZE="$2"; shift 2 ;;
+    --train-max-examples) TRAIN_MAX_EXAMPLES="$2"; shift 2 ;;
+    --train-max-eval-examples) TRAIN_MAX_EVAL_EXAMPLES="$2"; shift 2 ;;
+    --train-learning-rate) TRAIN_LEARNING_RATE="$2"; shift 2 ;;
+    --train-sparse-backend) TRAIN_SPARSE_BACKEND="$2"; shift 2 ;;
+    --train-position-strategy) TRAIN_POSITION_STRATEGY="$2"; shift 2 ;;
+    --train-question-position-gap) TRAIN_QUESTION_POSITION_GAP="$2"; shift 2 ;;
     --config) CONFIG="$2"; shift 2 ;;
     --base-model) BASE_MODEL="$2"; shift 2 ;;
     --input-jsonl) INPUT_JSONL="$2"; shift 2 ;;
@@ -120,13 +180,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$CHECKPOINT" ]]; then
-  echo "Missing required --checkpoint for scratchpad eval." >&2
-  usage >&2
-  exit 2
-fi
-if [[ ! -e "$CHECKPOINT" ]]; then
-  echo "Scratchpad checkpoint does not exist: $CHECKPOINT" >&2
-  exit 1
+  CHECKPOINT="$(config_value output_dir outputs/scratchpad_multihop_qwen3_1_7b)"
 fi
 if [[ ! -f "$INPUT_JSONL" ]]; then
   echo "Missing multi-hop eval JSONL: $INPUT_JSONL" >&2
@@ -140,9 +194,40 @@ if [[ ! -d "$LITM_DIR" ]]; then
 fi
 check_litm_files
 
+should_train=0
+if [[ "$SKIP_TRAIN" -eq 1 ]]; then
+  if [[ ! -e "$CHECKPOINT" ]]; then
+    echo "Scratchpad checkpoint does not exist and --skip-train was set: $CHECKPOINT" >&2
+    exit 1
+  fi
+elif [[ "$FORCE_TRAIN" -eq 1 || ! -e "$CHECKPOINT" ]]; then
+  should_train=1
+else
+  echo "Using existing scratchpad checkpoint: $CHECKPOINT" >&2
+  echo "Pass --force-train to retrain before eval." >&2
+fi
+
 mkdir -p "$OUTPUT_DIR"
 
-cmd=(
+train_cmd=(
+  python scripts/train_scratchpad.py
+  --config "$CONFIG"
+  --output-dir "$CHECKPOINT"
+)
+
+[[ -n "$BASE_MODEL" ]] && train_cmd+=(--model "$BASE_MODEL")
+[[ -n "$TRAIN_JSONL" ]] && train_cmd+=(--train-jsonl "$TRAIN_JSONL")
+[[ -n "$TRAIN_EVAL_JSONL" ]] && train_cmd+=(--eval-jsonl "$TRAIN_EVAL_JSONL")
+[[ -n "$TRAIN_MAX_STEPS" ]] && train_cmd+=(--max-steps "$TRAIN_MAX_STEPS")
+[[ -n "$TRAIN_BATCH_SIZE" ]] && train_cmd+=(--batch-size "$TRAIN_BATCH_SIZE")
+[[ -n "$TRAIN_MAX_EXAMPLES" ]] && train_cmd+=(--max-train-examples "$TRAIN_MAX_EXAMPLES")
+[[ -n "$TRAIN_MAX_EVAL_EXAMPLES" ]] && train_cmd+=(--max-eval-examples "$TRAIN_MAX_EVAL_EXAMPLES")
+[[ -n "$TRAIN_LEARNING_RATE" ]] && train_cmd+=(--learning-rate "$TRAIN_LEARNING_RATE")
+[[ -n "$TRAIN_SPARSE_BACKEND" ]] && train_cmd+=(--sparse-attention-backend "$TRAIN_SPARSE_BACKEND")
+[[ -n "$TRAIN_POSITION_STRATEGY" ]] && train_cmd+=(--position-strategy "$TRAIN_POSITION_STRATEGY")
+[[ -n "$TRAIN_QUESTION_POSITION_GAP" ]] && train_cmd+=(--question-position-gap "$TRAIN_QUESTION_POSITION_GAP")
+
+eval_cmd=(
   python scripts/eval_scratchpad.py
   --config "$CONFIG"
   --methods "scratchpad_noscale,scratchpad_scaled,scratchpad_scaled_pos512"
@@ -157,20 +242,28 @@ cmd=(
   --order-variants "as_is"
 )
 
-[[ -n "$BASE_MODEL" ]] && cmd+=(--base-model "$BASE_MODEL")
-[[ -n "$MAX_EXAMPLES" ]] && cmd+=(--max-examples "$MAX_EXAMPLES")
-[[ -n "$LIMIT_PER_LITM_FILE" ]] && cmd+=(--limit-per-litm-file "$LIMIT_PER_LITM_FILE")
-[[ -n "$MAX_NEW_TOKENS" ]] && cmd+=(--max-new-tokens "$MAX_NEW_TOKENS")
-[[ -n "$MAX_CONTEXT_TOKENS" ]] && cmd+=(--max-context-tokens "$MAX_CONTEXT_TOKENS")
-[[ -n "$APE_TEMPERATURE" ]] && cmd+=(--ape-temperature "$APE_TEMPERATURE")
-[[ -n "$APE_SCALE" ]] && cmd+=(--ape-scale "$APE_SCALE")
+[[ -n "$BASE_MODEL" ]] && eval_cmd+=(--base-model "$BASE_MODEL")
+[[ -n "$MAX_EXAMPLES" ]] && eval_cmd+=(--max-examples "$MAX_EXAMPLES")
+[[ -n "$LIMIT_PER_LITM_FILE" ]] && eval_cmd+=(--limit-per-litm-file "$LIMIT_PER_LITM_FILE")
+[[ -n "$MAX_NEW_TOKENS" ]] && eval_cmd+=(--max-new-tokens "$MAX_NEW_TOKENS")
+[[ -n "$MAX_CONTEXT_TOKENS" ]] && eval_cmd+=(--max-context-tokens "$MAX_CONTEXT_TOKENS")
+[[ -n "$APE_TEMPERATURE" ]] && eval_cmd+=(--ape-temperature "$APE_TEMPERATURE")
+[[ -n "$APE_SCALE" ]] && eval_cmd+=(--ape-scale "$APE_SCALE")
 
-printf 'Running: CUDA_VISIBLE_DEVICES=%q' "$CUDA_DEVICE"
-printf ' %q' "${cmd[@]}"
+if [[ "$should_train" -eq 1 ]]; then
+  printf 'Training: CUDA_VISIBLE_DEVICES=%q' "$CUDA_DEVICE"
+  printf ' %q' "${train_cmd[@]}"
+  printf '\n'
+fi
+printf 'Evaluating: CUDA_VISIBLE_DEVICES=%q' "$CUDA_DEVICE"
+printf ' %q' "${eval_cmd[@]}"
 printf '\n'
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "${cmd[@]}"
+if [[ "$should_train" -eq 1 ]]; then
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "${train_cmd[@]}"
+fi
+CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "${eval_cmd[@]}"
