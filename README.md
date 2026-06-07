@@ -36,9 +36,9 @@ This checkout also includes a lightweight SFT/eval path for positional-bias rese
 
 - trains **32 distinct scratchpad/gist special tokens** after the query and before the answer
 - trains with causal LM loss and LoRA; APE temperature/scale is not used during training
-- uses APE-style block-sparse training attention by default: each `prefix + doc_i` stream is isolated, while query/scratch/answer attend prefix plus all docs
+- uses APE-style block-sparse training attention: each `prefix + doc_i` stream is isolated, while query/scratch/answer attend prefix plus all docs
 - uses APE-parallel positions during training: prefix positions are normal, every document reuses the same post-prefix band, and query/scratch/answer start after `prefix_len + max_doc_len`
-- the default `flash_block` backend issues FlashAttention calls per block; `sdpa_mask` is available as a correctness fallback
+- the default `flash_block` backend uses FlashAttention calls per sparse block; `sdpa_mask` and `eager_block` remain available as correctness/debug references
 - includes a dense causal decoder-only SFT baseline on the same JSONL data with `flash_attention_2`
 - renders prompts as APE fields: `prefix`, parallel `contexts`, then `query`
 - evaluates base APE scaled variants, a normal causal `decoder` baseline, and trained scratchpad-checkpoint variants: `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512`
@@ -70,10 +70,25 @@ python scripts/train_decoder.py \
   --config configs/scratchpad_multihop.yaml
 ```
 
-Check sparse attention semantics and gradient equivalence before trusting `flash_block`:
+Check sparse attention semantics and strict gradient equivalence against the SDPA mask reference:
 
 ```bash
-python scripts/check_sparse_attention_gradients.py --fake-flash
+python scripts/check_sparse_attention_gradients.py --fake-flash --batch-size 2 --atol 1e-6
+```
+
+The default checker uses `eager_block` and also verifies that gradients reach embeddings and Q/K/V/O projections:
+
+```bash
+python scripts/check_sparse_attention_gradients.py --batch-size 2 --atol 1e-6
+```
+
+To measure installed FlashAttention numeric drift separately:
+
+```bash
+python scripts/check_sparse_attention_gradients.py \
+  --real-flash \
+  --batch-size 2 \
+  --allow-real-flash-drift
 ```
 
 Download the original Lost-in-the-Middle NaturalQuestions files:
@@ -113,9 +128,9 @@ scripts/run_scratchpad_eval_suite.sh \
   --litm-dir data/litm_nq
 ```
 
-`run_ape_eval_suite.sh` runs `ape_scaled`, `ape_scaled_pos64`, `ape_scaled_pos128`, `ape_scaled_pos512`, and `decoder`. The decoder gets LITM `start,middle,end`; APE methods use the representative `--parallel-litm-positions start`.
+`run_ape_eval_suite.sh` runs `ape_scaled`, `ape_scaled_pos64`, `ape_scaled_pos128`, `ape_scaled_pos512`, and `decoder` on CUDA device 2 by default. The decoder gets LITM `start,middle,end`; APE methods use the representative `--parallel-litm-positions start`.
 
-`run_scratchpad_eval_suite.sh` runs `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512` from the trained checkpoint, with multi-hop `as_is` and representative LITM by default.
+`run_scratchpad_eval_suite.sh` runs `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512` from the trained checkpoint on CUDA device 3 by default, with multi-hop `as_is` and representative LITM by default. Both wrappers check that the requested LITM files are present before eval starts.
 
 ## TODOs
 We will release the code and data in the following order, please stay tuned!

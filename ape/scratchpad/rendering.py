@@ -330,10 +330,10 @@ class ScratchpadCollator:
                 dtype=self.sdpa_mask_dtype,
                 device=sparse_mask.device,
             ).masked_fill(~sparse_mask, torch.finfo(self.sdpa_mask_dtype).min)
-        elif self.sparse_attention_backend in {"flash_block", "dense"}:
+        elif self.sparse_attention_backend in {"eager_block", "flash_block", "dense"}:
             pass
         else:
             raise ValueError(f"Unknown sparse_attention_backend: {self.sparse_attention_backend}")
-        if self.sparse_attention_backend != "flash_block":
+        if self.sparse_attention_backend not in {"eager_block", "flash_block"}:
             padded.pop("segment_ids", None)
         return padded

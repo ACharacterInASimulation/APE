@@ -145,7 +145,7 @@ def main() -> None:
     parser.add_argument("--max-seq-len", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
-    parser.add_argument("--sparse-attention-backend", choices=["flash_block", "sdpa_mask", "dense"], default=None)
+    parser.add_argument("--sparse-attention-backend", choices=["eager_block", "flash_block", "sdpa_mask", "dense"], default=None)
     parser.add_argument("--base-attn-implementation", default=None)
     parser.add_argument(
         "--position-strategy",
@@ -178,9 +178,9 @@ def main() -> None:
         cfg_get(config, "train.question_position_gap", DEFAULT_QUESTION_POSITION_GAP)
     )
     sparse_attention_backend = args.sparse_attention_backend or str(cfg_get(config, "train.sparse_attention_backend", "flash_block"))
-    if sparse_attention_backend not in {"flash_block", "sdpa_mask", "dense"}:
-        raise ValueError("train.sparse_attention_backend must be one of flash_block, sdpa_mask, dense")
-    if sparse_attention_backend in {"flash_block", "sdpa_mask"}:
+    if sparse_attention_backend not in {"eager_block", "flash_block", "sdpa_mask", "dense"}:
+        raise ValueError("train.sparse_attention_backend must be one of eager_block, flash_block, sdpa_mask, dense")
+    if sparse_attention_backend in {"eager_block", "flash_block", "sdpa_mask"}:
         load_attn_implementation = args.base_attn_implementation or str(cfg_get(config, "train.base_attn_implementation", "sdpa"))
     else:
         load_attn_implementation = cfg_get(config, "model.attn_implementation", "flash_attention_2")
@@ -193,14 +193,14 @@ def main() -> None:
         load_in_4bit=bool(cfg_get(config, "model.load_in_4bit", False)),
         device_map=cfg_get(config, "model.device_map", None),
     )
-    if sparse_attention_backend == "flash_block":
-        installed = install_qwen_block_sparse_attention(model)
-        print(f"installed flash block-sparse attention on {installed} Qwen attention layers")
+    if sparse_attention_backend in {"eager_block", "flash_block"}:
+        installed = install_qwen_block_sparse_attention(model, backend=sparse_attention_backend)
+        print(f"installed {sparse_attention_backend} sparse attention on {installed} Qwen attention layers")
     elif sparse_attention_backend == "sdpa_mask":
         print("using SDPA with a 4D APE block-sparse attention mask")
     else:
         print("using dense causal attention")
-    if sparse_attention_backend in {"flash_block", "sdpa_mask"}:
+    if sparse_attention_backend in {"eager_block", "flash_block", "sdpa_mask"}:
         model.config.use_cache = False
     add_special_tokens(tokenizer, model, scratchpad_tokens)
     model = apply_lora(model, config)

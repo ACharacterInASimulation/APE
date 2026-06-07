@@ -17,6 +17,7 @@ import types
 from typing import Any
 
 import torch
+from torch.nn import functional as F
 
 from .rendering import SEGMENT_DOC_START, SEGMENT_PAD, SEGMENT_PREFIX, SEGMENT_SUFFIX
 
@@ -113,6 +114,31 @@ def _flash_block(
     )
 
 
+def _eager_block(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    dropout_p: float,
+    softmax_scale: float | None,
+) -> torch.Tensor:
+    scale = float(softmax_scale) if softmax_scale is not None else q.shape[-1] ** -0.5
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+    scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale
+    if causal:
+        q_len = q.shape[1]
+        k_len = k.shape[1]
+        q_idx = torch.arange(q_len, device=q.device)[:, None]
+        k_idx = torch.arange(k_len, device=q.device)[None, :]
+        allowed = k_idx <= q_idx + (k_len - q_len)
+        scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+    probs = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+    probs = F.dropout(probs, p=dropout_p, training=dropout_p > 0.0)
+    return torch.matmul(probs, v_t).transpose(1, 2).contiguous()
+
+
 def _block_sparse_flash_attention(
     self: Any,
     query_states: torch.Tensor,
@@ -120,7 +146,13 @@ def _block_sparse_flash_attention(
     value_states: torch.Tensor,
     segment_ids: torch.Tensor,
 ) -> torch.Tensor:
-    flash_attn_func = _flash_attn_func()
+    backend = getattr(self, "_ape_sparse_block_backend", "flash_block")
+    if backend == "flash_block":
+        flash_attn_func = _flash_attn_func()
+    elif backend == "eager_block":
+        flash_attn_func = None
+    else:
+        raise ValueError(f"Unknown sparse block attention backend: {backend}")
     num_key_value_groups = getattr(
         self,
         "num_key_value_groups",
@@ -145,14 +177,15 @@ def _block_sparse_flash_attention(
 
         if prefix_span is not None:
             start, end = prefix_span
-            output[batch_idx : batch_idx + 1, start:end] = _flash_block(
+            output[batch_idx : batch_idx + 1, start:end] = _block_attention(
+                backend,
                 flash_attn_func,
                 query_states[batch_idx : batch_idx + 1, start:end],
                 key_states[batch_idx : batch_idx + 1, start:end],
                 value_states[batch_idx : batch_idx + 1, start:end],
-                causal=True,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
+                True,
+                dropout_p,
+                softmax_scale,
             )
 
         prefix_k = None
@@ -176,29 +209,48 @@ def _block_sparse_flash_attention(
             else:
                 block_k = doc_k
                 block_v = doc_v
-            output[batch_idx : batch_idx + 1, start:end] = _flash_block(
+            output[batch_idx : batch_idx + 1, start:end] = _block_attention(
+                backend,
                 flash_attn_func,
                 query_states[batch_idx : batch_idx + 1, start:end],
                 block_k,
                 block_v,
-                causal=True,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
+                True,
+                dropout_p,
+                softmax_scale,
             )
 
         suffix_span = _contiguous_span(seg == SEGMENT_SUFFIX)
         if suffix_span is not None:
             start, end = suffix_span
-            output[batch_idx : batch_idx + 1, start:end] = _flash_block(
+            output[batch_idx : batch_idx + 1, start:end] = _block_attention(
+                backend,
                 flash_attn_func,
                 query_states[batch_idx : batch_idx + 1, start:end],
                 key_states[batch_idx : batch_idx + 1, real_start:real_end],
                 value_states[batch_idx : batch_idx + 1, real_start:real_end],
-                causal=True,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
+                True,
+                dropout_p,
+                softmax_scale,
             )
     return output
+
+
+def _block_attention(
+    backend: str,
+    flash_attn_func,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    dropout_p: float,
+    softmax_scale: float | None,
+) -> torch.Tensor:
+    if backend == "flash_block":
+        return _flash_block(flash_attn_func, q, k, v, causal, dropout_p, softmax_scale)
+    if backend == "eager_block":
+        return _eager_block(q, k, v, causal, dropout_p, softmax_scale)
+    raise ValueError(f"Unknown sparse block attention backend: {backend}")
 
 
 def qwen_block_sparse_attention_forward(
@@ -234,7 +286,9 @@ def qwen_block_sparse_attention_forward(
     return attn_output, None
 
 
-def install_qwen_block_sparse_attention(model: torch.nn.Module) -> int:
+def install_qwen_block_sparse_attention(model: torch.nn.Module, backend: str = "flash_block") -> int:
+    if backend not in {"flash_block", "eager_block"}:
+        raise ValueError("backend must be flash_block or eager_block")
     if not QWEN_ATTENTION_CLASSES:
         raise ImportError("Qwen2/Qwen3 attention classes are not available in this Transformers install")
     installed = 0
@@ -242,6 +296,7 @@ def install_qwen_block_sparse_attention(model: torch.nn.Module) -> int:
         if isinstance(module, QWEN_ATTENTION_CLASSES):
             if not hasattr(module, "_ape_original_forward"):
                 module._ape_original_forward = module.forward
+            module._ape_sparse_block_backend = backend
             module.forward = types.MethodType(qwen_block_sparse_attention_forward, module)
             installed += 1
     return installed

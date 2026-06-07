@@ -17,7 +17,48 @@ MAX_NEW_TOKENS=""
 MAX_CONTEXT_TOKENS=""
 APE_TEMPERATURE=""
 APE_SCALE=""
+CUDA_DEVICE="${CUDA_DEVICE:-3}"
 DRY_RUN=0
+
+litm_gold_index() {
+  case "$1:$2" in
+    10:start) echo 0 ;;
+    10:middle) echo 4 ;;
+    10:end) echo 9 ;;
+    20:start) echo 0 ;;
+    20:middle) echo 9 ;;
+    20:end) echo 19 ;;
+    30:start) echo 0 ;;
+    30:middle) echo 14 ;;
+    30:end) echo 29 ;;
+    *) echo "Unsupported LITM doc-count/position: $1/$2" >&2; return 2 ;;
+  esac
+}
+
+check_litm_files() {
+  local missing=0
+  local count position gold_index path
+  IFS=',' read -r -a counts <<< "$LITM_DOC_COUNTS"
+  IFS=',' read -r -a positions <<< "$LITM_POSITIONS"
+  for count in "${counts[@]}"; do
+    count="${count//[[:space:]]/}"
+    [[ -z "$count" ]] && continue
+    for position in "${positions[@]}"; do
+      position="${position//[[:space:]]/}"
+      [[ -z "$position" ]] && continue
+      gold_index="$(litm_gold_index "$count" "$position")" || return $?
+      path="$LITM_DIR/${count}_total_documents/nq-open-${count}_total_documents_gold_at_${gold_index}.jsonl.gz"
+      if [[ ! -f "$path" ]]; then
+        echo "Missing LITM file: $path" >&2
+        missing=1
+      fi
+    done
+  done
+  if [[ "$missing" -ne 0 ]]; then
+    echo "Run scripts/download_litm_nq.py --output-dir \"$LITM_DIR\" --positions \"$LITM_POSITIONS\" before eval." >&2
+    return 1
+  fi
+}
 
 usage() {
   cat <<'EOF'
@@ -47,6 +88,7 @@ Options:
   --max-context-tokens N
   --ape-temperature FLOAT
   --ape-scale FLOAT
+  --cuda-device N               default: 3
   --dry-run
 EOF
 }
@@ -70,6 +112,7 @@ while [[ $# -gt 0 ]]; do
     --max-context-tokens) MAX_CONTEXT_TOKENS="$2"; shift 2 ;;
     --ape-temperature) APE_TEMPERATURE="$2"; shift 2 ;;
     --ape-scale) APE_SCALE="$2"; shift 2 ;;
+    --cuda-device) CUDA_DEVICE="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -95,6 +138,7 @@ if [[ ! -d "$LITM_DIR" ]]; then
   echo "Run scripts/download_litm_nq.py first, or pass --litm-dir." >&2
   exit 1
 fi
+check_litm_files
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -121,7 +165,7 @@ cmd=(
 [[ -n "$APE_TEMPERATURE" ]] && cmd+=(--ape-temperature "$APE_TEMPERATURE")
 [[ -n "$APE_SCALE" ]] && cmd+=(--ape-scale "$APE_SCALE")
 
-printf 'Running:'
+printf 'Running: CUDA_VISIBLE_DEVICES=%q' "$CUDA_DEVICE"
 printf ' %q' "${cmd[@]}"
 printf '\n'
 
@@ -129,4 +173,4 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-"${cmd[@]}"
+CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "${cmd[@]}"

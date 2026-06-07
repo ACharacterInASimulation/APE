@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Empirically benchmark sdpa_mask vs flash_block sparse training attention."""
+"""Empirically benchmark sparse training attention backends."""
 
 from __future__ import annotations
 
@@ -107,9 +107,10 @@ def run_backend(backend: str, args: argparse.Namespace, device: torch.device) ->
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
 
+    torch.manual_seed(int(args.seed))
     model = tiny_qwen_model(args, device)
-    if backend == "flash_block":
-        installed = install_qwen_block_sparse_attention(model)
+    if backend in {"eager_block", "flash_block"}:
+        installed = install_qwen_block_sparse_attention(model, backend=backend)
         if installed <= 0:
             raise RuntimeError("no Qwen attention layers were patched")
     elif backend != "sdpa_mask":
@@ -174,7 +175,8 @@ def main() -> None:
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--steps", type=int, default=3)
-    parser.add_argument("--backends", default="sdpa_mask,flash_block")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--backends", default="sdpa_mask,eager_block,flash_block")
     parser.add_argument("--output-json", default=None)
     args = parser.parse_args()
 

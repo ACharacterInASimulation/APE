@@ -83,8 +83,9 @@ data:
 train:
   # Default training attention is APE-style block sparse:
   # prefix/doc_i streams are isolated from other docs, while query/scratch/answer
-  # attend prefix plus every document. flash_block uses flash_attn_func calls per
-  # block; sdpa_mask is a correctness fallback with a 4D mask.
+  # attend prefix plus every document. flash_block is the default fast backend.
+  # sdpa_mask is the strict 4D-mask correctness reference; eager_block is a
+  # block-wise fp32-softmax reference for debugging.
   sparse_attention_backend: flash_block
   base_attn_implementation: sdpa
   batch_size: 1

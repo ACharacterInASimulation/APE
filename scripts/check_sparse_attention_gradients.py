@@ -61,10 +61,9 @@ def fake_flash_attn_func(
     return out
 
 
-def assert_close(name: str, value: float, tolerance: float) -> None:
+def report_close(name: str, value: float, tolerance: float) -> bool:
     print(f"{name}: {value:.8g}")
-    if value > tolerance:
-        raise AssertionError(f"{name}={value:.8g} exceeds tolerance={tolerance:.8g}")
+    return value <= tolerance
 
 
 def max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -221,6 +220,39 @@ def compare_gradients(reference: torch.nn.Module, candidate: torch.nn.Module) ->
     return max_diff, max_name
 
 
+def check_required_gradient_flow(model: torch.nn.Module) -> None:
+    required = ["embed_tokens", "q_proj", "k_proj", "v_proj", "o_proj"]
+    failures = []
+    for fragment in required:
+        matched = [
+            (name, param)
+            for name, param in model.named_parameters()
+            if fragment in name and param.requires_grad
+        ]
+        if not matched:
+            failures.append(f"{fragment}: no trainable parameter matched")
+            continue
+        max_norm = 0.0
+        missing = []
+        for name, param in matched:
+            if param.grad is None:
+                missing.append(name)
+                continue
+            grad = param.grad.detach().float()
+            if not torch.isfinite(grad).all():
+                failures.append(f"{name}: non-finite gradient")
+                continue
+            max_norm = max(max_norm, float(grad.abs().max().item()))
+        if missing:
+            failures.append(f"{fragment}: missing gradients for {missing[:3]}")
+        if max_norm == 0.0:
+            failures.append(f"{fragment}: all matched gradients are zero")
+        else:
+            print(f"gradient flow {fragment}: max_abs={max_norm:.8g}")
+    if failures:
+        raise AssertionError("; ".join(failures))
+
+
 def flash_available() -> bool:
     try:
         import flash_attn  # noqa: F401
@@ -234,36 +266,62 @@ def main() -> None:
     parser.add_argument("--atol", type=float, default=None)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default=None)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--backend", choices=["eager_block", "flash_block"], default=None)
     parser.add_argument("--fake-flash", action="store_true", help="Use a CPU-compatible fake flash_attn_func.")
     parser.add_argument("--real-flash", action="store_true", help="Require an installed flash-attn backend.")
+    parser.add_argument(
+        "--allow-real-flash-drift",
+        action="store_true",
+        help="Treat real bf16/fp16 FlashAttention as an approximate kernel drift probe, not strict equivalence.",
+    )
+    parser.add_argument("--real-flash-drift-atol", type=float, default=5.0e-2)
     args = parser.parse_args()
 
     check_mask_semantics()
     check_position_ids()
 
-    use_fake_flash = args.fake_flash or not flash_available()
+    candidate_backend = args.backend or ("flash_block" if args.fake_flash or args.real_flash else "eager_block")
+    if args.real_flash and candidate_backend != "flash_block":
+        raise ValueError("--real-flash requires --backend flash_block")
+    if args.fake_flash and candidate_backend != "flash_block":
+        raise ValueError("--fake-flash requires --backend flash_block")
+    use_fake_flash = candidate_backend == "flash_block" and (args.fake_flash or not flash_available())
     if args.real_flash and use_fake_flash:
         raise RuntimeError("--real-flash requested, but flash-attn is not importable")
     if use_fake_flash:
         sparse_attention._flash_attn_func = lambda: fake_flash_attn_func
         print("flash backend: fake_flash_attn_func")
-    else:
+    elif candidate_backend == "flash_block":
         print("flash backend: installed flash_attn_func")
+    else:
+        print("block backend: eager_block")
 
     if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() and not use_fake_flash else "cpu")
+        device = torch.device("cuda" if candidate_backend == "flash_block" and torch.cuda.is_available() and not use_fake_flash else "cpu")
     else:
         device = torch.device(args.device)
-    if not use_fake_flash and device.type != "cuda":
+    if candidate_backend == "flash_block" and not use_fake_flash and device.type != "cuda":
         raise RuntimeError("Real flash-attn checks require a CUDA device")
-    model_dtype = torch.bfloat16 if not use_fake_flash else torch.float32
-    tolerance = float(args.atol) if args.atol is not None else (5.0e-2 if not use_fake_flash else 2.0e-5)
-    print(f"device: {device}, dtype: {model_dtype}, tolerance: {tolerance:.8g}")
+    dtype_map = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+    model_dtype = dtype_map[args.dtype] if args.dtype else (torch.bfloat16 if candidate_backend == "flash_block" and not use_fake_flash else torch.float32)
+    if candidate_backend == "flash_block" and not use_fake_flash and args.allow_real_flash_drift:
+        tolerance = float(args.atol) if args.atol is not None else float(args.real_flash_drift_atol)
+        mode = "real-flash numerical drift probe"
+    else:
+        tolerance = float(args.atol) if args.atol is not None else (1.0e-5 if not use_fake_flash else 1.0e-6)
+        mode = "strict gradient equivalence"
+    print(f"candidate backend: {candidate_backend}")
+    print(f"device: {device}, dtype: {model_dtype}, mode: {mode}, tolerance: {tolerance:.8g}")
     torch.manual_seed(int(args.seed))
     reference = tiny_qwen_model().to(device=device, dtype=model_dtype)
     candidate = copy.deepcopy(reference).to(device=device, dtype=model_dtype)
-    installed = install_qwen_block_sparse_attention(candidate)
+    installed = install_qwen_block_sparse_attention(candidate, backend=candidate_backend)
     if installed <= 0:
         raise RuntimeError("No Qwen attention layers were patched for flash_block")
 
@@ -274,6 +332,7 @@ def main() -> None:
     )
     ref_output = run_forward_backward(reference, ref_batch)
     cand_output = run_forward_backward(candidate, flash_batch)
+    check_required_gradient_flow(candidate)
 
     loss_diff = abs(float(ref_output.loss.detach().float()) - float(cand_output.loss.detach().float()))
     all_logits_diff = max_abs(ref_output.logits[real_mask], cand_output.logits[real_mask])
@@ -286,12 +345,26 @@ def main() -> None:
         hidden_diff = max(hidden_diff, max_abs(ref_hidden[real_mask], cand_hidden[real_mask]))
     grad_diff, grad_name = compare_gradients(reference, candidate)
 
-    assert_close("loss diff", loss_diff, tolerance)
-    assert_close("all logits max diff", all_logits_diff, tolerance)
-    assert_close("suffix logits max diff", suffix_logits_diff, tolerance)
-    assert_close("hidden states max diff", hidden_diff, tolerance)
-    assert_close(f"parameter gradients max diff ({grad_name or 'none'})", grad_diff, tolerance)
-    print("sparse attention gradient equivalence: ok")
+    checks = [
+        ("loss diff", loss_diff),
+        ("all logits max diff", all_logits_diff),
+        ("suffix logits max diff", suffix_logits_diff),
+        ("hidden states max diff", hidden_diff),
+        (f"parameter gradients max diff ({grad_name or 'none'})", grad_diff),
+    ]
+    failures = [
+        f"{name}={value:.8g}"
+        for name, value in checks
+        if not report_close(name, value, tolerance)
+    ]
+    if failures:
+        raise AssertionError(
+            "; ".join(failures) + f" exceed tolerance={tolerance:.8g}"
+        )
+    if candidate_backend == "flash_block" and not use_fake_flash and args.allow_real_flash_drift:
+        print("real flash numerical drift: within configured tolerance")
+    else:
+        print("sparse attention gradient equivalence: ok")
 
 
 if __name__ == "__main__":
