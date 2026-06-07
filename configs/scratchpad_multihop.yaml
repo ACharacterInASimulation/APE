@@ -1,6 +1,7 @@
 run_name: scratchpad_multihop
 seed: 42
 output_dir: outputs/scratchpad_multihop_qwen3_1_7b
+decoder_output_dir: outputs/decoder_multihop_qwen3_1_7b
 
 model:
   name_or_path: Qwen/Qwen3-1.7B
@@ -112,12 +113,20 @@ train:
   position_strategy: standard
   question_position_gap: 512
 
+decoder_train:
+  # Dense causal decoder baseline on the same materialized JSONL dataset.
+  attn_implementation: flash_attention_2
+
 eval:
   methods:
     - decoder
     - scratchpad_noscale
     - scratchpad_scaled
     - scratchpad_scaled_pos512
+  # Parallel methods are position-invariant, so they only need one LITM
+  # representative. The decoder still uses eval --litm-positions.
+  parallel_litm_positions:
+    - start
   max_new_tokens: 64
   ape_temperature: 0.9
   ape_scale: 0.9

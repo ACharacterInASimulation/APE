@@ -86,7 +86,8 @@ def generate_with_ape(
         padding=True,
         add_special_tokens=False,
     ).input_ids
-    context_mask = (context_ids != tokenizer.pad_token_id).reshape(-1)
+    context_mask_cpu = (context_ids != tokenizer.pad_token_id).reshape(-1)
+    context_mask = context_mask_cpu.to(model.device)
 
     enable_attention_prefill_prefix(model_name, model)
     outputs = model(prefix_ids.to(model.device), past_key_values=None, use_cache=True)
@@ -131,7 +132,7 @@ def generate_with_ape(
         )
         merged_cache.append((past_key, past_value, past_position, len(contexts)))
 
-    flattened_context_ids = context_ids.flatten()[context_mask].unsqueeze(0)
+    flattened_context_ids = context_ids.flatten()[context_mask_cpu].unsqueeze(0)
     input_ids = torch.cat([prefix_ids, flattened_context_ids.cpu(), query_ids], dim=-1)
     context_length = input_ids.shape[-1]
 

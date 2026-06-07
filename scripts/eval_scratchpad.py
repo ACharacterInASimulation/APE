@@ -68,6 +68,12 @@ def parse_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def parse_config_csv(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return parse_csv(str(value))
+
+
 def expand_methods(methods: str) -> list[str]:
     requested = parse_csv(methods)
     if requested == ["all"] or "all" in requested:
@@ -169,6 +175,22 @@ def load_litm_examples(
     return pairs
 
 
+def should_evaluate_pair(
+    method: str,
+    variant: str,
+    example: dict[str, Any],
+    parallel_litm_positions: set[str],
+) -> bool:
+    if method == "decoder":
+        return True
+    if example.get("source") == "litm_nq":
+        position = str(example.get("metadata", {}).get("position", ""))
+        return position in parallel_litm_positions
+    if variant != "as_is":
+        return False
+    return True
+
+
 @torch.no_grad()
 def generate_decoder(
     model: Any,
@@ -182,19 +204,23 @@ def generate_decoder(
     contexts = build_context_fields(example) or [""]
     prefix_ids = tokenizer(prefix, truncation=False, add_special_tokens=False).input_ids
     query_ids = tokenizer(query, truncation=False, add_special_tokens=False).input_ids
+    separator_ids = tokenizer("\n\n", truncation=False, add_special_tokens=False).input_ids
     prompt_budget = max(1, int(max_context_tokens) - int(max_new_tokens))
     context_budget = max(1, prompt_budget - len(prefix_ids) - len(query_ids))
     per_context_max = max(1, math.floor(context_budget / max(len(contexts), 1)))
-    context_ids = [
-        tokenizer(
-            context,
-            truncation=True,
-            max_length=per_context_max,
-            add_special_tokens=False,
-        ).input_ids
-        for context in contexts
-    ]
-    input_ids = prefix_ids + [token_id for doc_ids in context_ids for token_id in doc_ids] + query_ids
+    context_ids = []
+    for context_index, context in enumerate(contexts):
+        if context_index > 0:
+            context_ids.extend(separator_ids)
+        context_ids.extend(
+            tokenizer(
+                context,
+                truncation=True,
+                max_length=per_context_max,
+                add_special_tokens=False,
+            ).input_ids
+        )
+    input_ids = prefix_ids + context_ids + query_ids
     if len(input_ids) > prompt_budget:
         keep_query = min(len(query_ids), prompt_budget)
         remaining = prompt_budget - keep_query
@@ -240,13 +266,14 @@ def main() -> None:
     parser.add_argument("--decoder-checkpoint", default=None)
     parser.add_argument("--input-jsonl", default=None)
     parser.add_argument("--litm-dir", default=None)
-    parser.add_argument("--methods", default="decoder,scratchpad_noscale,scratchpad_scaled,scratchpad_scaled_pos512")
+    parser.add_argument("--methods", default=None)
     parser.add_argument("--output-jsonl", default="outputs/scratchpad_eval/predictions.jsonl")
     parser.add_argument("--metrics-json", default=None)
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--limit-per-litm-file", type=int, default=None)
     parser.add_argument("--litm-doc-counts", default="10,20,30")
     parser.add_argument("--litm-positions", default="start,middle,end")
+    parser.add_argument("--parallel-litm-positions", default=None)
     parser.add_argument("--order-variants", default="as_is,gold_start,gold_middle,gold_end")
     parser.add_argument("--scratchpad-len", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
@@ -273,7 +300,14 @@ def main() -> None:
     question_position_gap = args.question_position_gap or int(
         cfg_get(config, "eval.question_position_gap", DEFAULT_QUESTION_POSITION_GAP)
     )
-    methods = expand_methods(args.methods)
+    method_config = cfg_get(config, "eval.methods", ALL_METHODS)
+    method_string = args.methods if args.methods else ",".join(parse_config_csv(method_config))
+    methods = expand_methods(method_string)
+    parallel_litm_positions = set(
+        parse_csv(args.parallel_litm_positions)
+        if args.parallel_litm_positions
+        else parse_config_csv(cfg_get(config, "eval.parallel_litm_positions", ["start"]))
+    )
 
     example_pairs: list[tuple[str, dict[str, Any]]] = []
     if args.input_jsonl:
@@ -319,6 +353,8 @@ def main() -> None:
         scale = ape_scale if scaled else 1.0
         query_position_shift = question_position_gap if method == "scratchpad_scaled_pos512" else 0
         for variant, example in tqdm(example_pairs, desc=method, dynamic_ncols=True):
+            if not should_evaluate_pair(method, variant, example, parallel_litm_positions):
+                continue
             if method == "decoder":
                 prediction = generate_decoder(
                     model=model,

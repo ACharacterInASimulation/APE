@@ -220,6 +220,27 @@ def encode_training_example(
     }
 
 
+def encode_decoder_training_example(
+    tokenizer: Any,
+    example: dict[str, Any],
+    max_seq_len: int,
+    append_eos: bool = True,
+) -> dict[str, list[int]]:
+    prompt_ids = encode_text(tokenizer, render_prompt(example, scratchpad_tokens=None))
+    answer_ids = encode_text(
+        tokenizer,
+        render_answer(example, tokenizer.eos_token if append_eos else None),
+    )
+    input_ids = prompt_ids + answer_ids
+    if len(input_ids) > int(max_seq_len):
+        raise ValueError(f"Encoded example has {len(input_ids)} tokens, above max_seq_len={max_seq_len}")
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": [-100] * len(prompt_ids) + answer_ids,
+    }
+
+
 def build_sparse_block_mask(segment_ids: torch.Tensor) -> torch.Tensor:
     """Build APE block-sparse causal attention.
 

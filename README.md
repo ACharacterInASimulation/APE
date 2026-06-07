@@ -39,9 +39,10 @@ This checkout also includes a lightweight SFT/eval path for positional-bias rese
 - uses APE-style block-sparse training attention by default: each `prefix + doc_i` stream is isolated, while query/scratch/answer attend prefix plus all docs
 - uses APE-parallel positions during training: prefix positions are normal, every document reuses the same post-prefix band, and query/scratch/answer start after `prefix_len + max_doc_len`
 - the default `flash_block` backend issues FlashAttention calls per block; `sdpa_mask` is available as a correctness fallback
+- includes a dense causal decoder-only SFT baseline on the same JSONL data with `flash_attention_2`
 - renders prompts as APE fields: `prefix`, parallel `contexts`, then `query`
 - evaluates a normal causal `decoder` baseline plus trained scratchpad-checkpoint variants: `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512`
-- supports the LITM NaturalQuestions start/middle/end setup and multi-hop QA sources
+- supports the LITM NaturalQuestions start/middle/end setup for the causal decoder baseline; parallel methods run a single representative LITM position by default
 - keeps the requested multi-hop mix in the materialized JSONL path; the original APE experiments only partially cover this set directly
 
 Prepare the six-source 20k-per-source training mix with a fast tokenizer length cutoff at 4096:
@@ -62,6 +63,13 @@ python scripts/train_scratchpad.py \
   --config configs/scratchpad_multihop.yaml
 ```
 
+Train the dense causal decoder baseline on the same dataset:
+
+```bash
+python scripts/train_decoder.py \
+  --config configs/scratchpad_multihop.yaml
+```
+
 Check sparse attention semantics and gradient equivalence before trusting `flash_block`:
 
 ```bash
@@ -76,7 +84,7 @@ python scripts/download_litm_nq.py \
   --positions start,middle,end
 ```
 
-Evaluate the normal causal decoder baseline and trained scratchpad checkpoint variants:
+Evaluate the normal causal decoder baseline and trained scratchpad checkpoint variants. LITM start/middle/end is reported for `decoder`; scratchpad APE methods run only the representative `--parallel-litm-positions` subset, default `start`, and skip extra gold-doc order variants.
 
 ```bash
 python scripts/eval_scratchpad.py \
@@ -88,7 +96,7 @@ python scripts/eval_scratchpad.py \
   --output-jsonl outputs/scratchpad_eval/predictions.jsonl
 ```
 
-By default, `decoder` loads the base model even when `--checkpoint` is supplied for the scratchpad methods. To evaluate normal causal generation from a checkpoint, pass `--decoder-checkpoint path/to/checkpoint`.
+By default, `decoder` loads the base model even when `--checkpoint` is supplied for the scratchpad methods. To evaluate the trained dense decoder baseline, pass `--decoder-checkpoint outputs/decoder_multihop_qwen3_1_7b`.
 
 The `scratchpad_scaled_pos512` method applies the ablation where query/scratch/answer positions start at `prefix_len + max_doc_len + 512` inside APE query prefill.
 
