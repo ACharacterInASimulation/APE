@@ -12,9 +12,14 @@ TRAIN_JSONL=""
 TRAIN_EVAL_JSONL=""
 TRAIN_MAX_STEPS=""
 TRAIN_BATCH_SIZE=""
+TRAIN_GRAD_ACCUM_STEPS=""
+TRAIN_WARMUP_STEPS=""
+TRAIN_LOGGING_STEPS=""
 TRAIN_MAX_EXAMPLES=""
 TRAIN_MAX_EVAL_EXAMPLES=""
 TRAIN_LEARNING_RATE=""
+TRAIN_SCRATCHPAD_LEARNING_RATE=""
+TRAIN_SCRATCHPAD_INIT_TEXT=""
 TRAIN_SPARSE_BACKEND=""
 TRAIN_POSITION_STRATEGY=""
 TRAIN_QUESTION_POSITION_GAP=""
@@ -116,9 +121,14 @@ Options:
   --train-eval-jsonl PATH
   --train-max-steps N
   --train-batch-size N
+  --train-grad-accum-steps N
+  --train-warmup-steps N
+  --train-logging-steps N
   --train-max-examples N
   --train-max-eval-examples N
   --train-learning-rate FLOAT
+  --train-scratchpad-learning-rate FLOAT
+  --train-scratchpad-init-text TEXT
   --train-sparse-backend NAME    flash_block, sdpa_mask, eager_block, dense
   --train-position-strategy NAME
   --train-question-position-gap N
@@ -152,9 +162,14 @@ while [[ $# -gt 0 ]]; do
     --train-eval-jsonl) TRAIN_EVAL_JSONL="$2"; shift 2 ;;
     --train-max-steps) TRAIN_MAX_STEPS="$2"; shift 2 ;;
     --train-batch-size) TRAIN_BATCH_SIZE="$2"; shift 2 ;;
+    --train-grad-accum-steps) TRAIN_GRAD_ACCUM_STEPS="$2"; shift 2 ;;
+    --train-warmup-steps) TRAIN_WARMUP_STEPS="$2"; shift 2 ;;
+    --train-logging-steps) TRAIN_LOGGING_STEPS="$2"; shift 2 ;;
     --train-max-examples) TRAIN_MAX_EXAMPLES="$2"; shift 2 ;;
     --train-max-eval-examples) TRAIN_MAX_EVAL_EXAMPLES="$2"; shift 2 ;;
     --train-learning-rate) TRAIN_LEARNING_RATE="$2"; shift 2 ;;
+    --train-scratchpad-learning-rate) TRAIN_SCRATCHPAD_LEARNING_RATE="$2"; shift 2 ;;
+    --train-scratchpad-init-text) TRAIN_SCRATCHPAD_INIT_TEXT="$2"; shift 2 ;;
     --train-sparse-backend) TRAIN_SPARSE_BACKEND="$2"; shift 2 ;;
     --train-position-strategy) TRAIN_POSITION_STRATEGY="$2"; shift 2 ;;
     --train-question-position-gap) TRAIN_QUESTION_POSITION_GAP="$2"; shift 2 ;;
@@ -220,9 +235,14 @@ train_cmd=(
 [[ -n "$TRAIN_EVAL_JSONL" ]] && train_cmd+=(--eval-jsonl "$TRAIN_EVAL_JSONL")
 [[ -n "$TRAIN_MAX_STEPS" ]] && train_cmd+=(--max-steps "$TRAIN_MAX_STEPS")
 [[ -n "$TRAIN_BATCH_SIZE" ]] && train_cmd+=(--batch-size "$TRAIN_BATCH_SIZE")
+[[ -n "$TRAIN_GRAD_ACCUM_STEPS" ]] && train_cmd+=(--grad-accum-steps "$TRAIN_GRAD_ACCUM_STEPS")
+[[ -n "$TRAIN_WARMUP_STEPS" ]] && train_cmd+=(--warmup-steps "$TRAIN_WARMUP_STEPS")
+[[ -n "$TRAIN_LOGGING_STEPS" ]] && train_cmd+=(--logging-steps "$TRAIN_LOGGING_STEPS")
 [[ -n "$TRAIN_MAX_EXAMPLES" ]] && train_cmd+=(--max-train-examples "$TRAIN_MAX_EXAMPLES")
 [[ -n "$TRAIN_MAX_EVAL_EXAMPLES" ]] && train_cmd+=(--max-eval-examples "$TRAIN_MAX_EVAL_EXAMPLES")
 [[ -n "$TRAIN_LEARNING_RATE" ]] && train_cmd+=(--learning-rate "$TRAIN_LEARNING_RATE")
+[[ -n "$TRAIN_SCRATCHPAD_LEARNING_RATE" ]] && train_cmd+=(--scratchpad-learning-rate "$TRAIN_SCRATCHPAD_LEARNING_RATE")
+[[ -n "$TRAIN_SCRATCHPAD_INIT_TEXT" ]] && train_cmd+=(--scratchpad-init-text "$TRAIN_SCRATCHPAD_INIT_TEXT")
 [[ -n "$TRAIN_SPARSE_BACKEND" ]] && train_cmd+=(--sparse-attention-backend "$TRAIN_SPARSE_BACKEND")
 [[ -n "$TRAIN_POSITION_STRATEGY" ]] && train_cmd+=(--position-strategy "$TRAIN_POSITION_STRATEGY")
 [[ -n "$TRAIN_QUESTION_POSITION_GAP" ]] && train_cmd+=(--question-position-gap "$TRAIN_QUESTION_POSITION_GAP")

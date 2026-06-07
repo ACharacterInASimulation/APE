@@ -35,6 +35,7 @@ To reproduce the APE results for retrieval-augmented generation (RAG) and in-con
 This checkout also includes a lightweight SFT/eval path for positional-bias research:
 
 - trains **32 distinct scratchpad/gist special tokens** after the query and before the answer
+- initializes scratch/gist embeddings from the full-stop token by default and trains them with their own LR (`1e-4` by default, versus `1e-5` for LoRA)
 - trains with causal LM loss and LoRA; APE temperature/scale is not used during training
 - uses APE-style block-sparse training attention: each `prefix + doc_i` stream is isolated, while query/scratch/answer attend prefix plus all docs
 - uses APE-parallel positions during training: prefix positions are normal, every document reuses the same post-prefix band, and query/scratch/answer start after `prefix_len + max_doc_len`
@@ -131,6 +132,8 @@ scripts/run_scratchpad_eval_suite.sh \
 `run_ape_eval_suite.sh` launches `ape_scaled`, `ape_scaled_pos64`, `ape_scaled_pos128`, `ape_scaled_pos512`, and `decoder` in parallel on CUDA device 2 by default. LITM defaults to 1000 examples from the 20-document files; decoder gets `start,middle,end`, while APE methods use the representative `--parallel-litm-positions start`; multi-hop defaults to `as_is` order.
 
 `run_scratchpad_eval_suite.sh` trains the scratchpad checkpoint first when the configured checkpoint is missing, then runs `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512` on CUDA device 3 by default. Pass `--train-batch-size 4` to try batch size 4, `--checkpoint PATH` to choose the train/eval checkpoint path, `--skip-train` to require an existing checkpoint, or `--force-train` to retrain before eval. Both wrappers check that the requested LITM files are present before eval starts.
+
+Scratchpad training defaults can be overridden with `--scratchpad-learning-rate` and `--scratchpad-init-text` on `scripts/train_scratchpad.py`, or `--train-scratchpad-learning-rate` and `--train-scratchpad-init-text` on `scripts/run_scratchpad_eval_suite.sh`.
 
 ## TODOs
 We will release the code and data in the following order, please stay tuned!

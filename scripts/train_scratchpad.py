@@ -19,7 +19,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from ape.scratchpad.data import load_examples_from_jsonl  # noqa: E402
 from ape.scratchpad.modeling import (  # noqa: E402
+    TrainableTokenEmbedding,
     add_special_tokens,
+    initialize_trainable_token_embeddings_from_text,
     install_trainable_token_embeddings,
     load_causal_lm,
     load_tokenizer,
@@ -99,7 +101,70 @@ class SaveScratchpadCallback(TrainerCallback):
         model = kwargs.get("model")
         if model is not None:
             save_scratchpad_state(model, self.tokenizer, checkpoint_dir, self.scratchpad_tokens)
+            self.tokenizer.save_pretrained(checkpoint_dir)
         return control
+
+
+class ScratchpadLrTrainer(Trainer):
+    def __init__(self, *args: Any, scratchpad_learning_rate: float | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.scratchpad_learning_rate = scratchpad_learning_rate
+
+    def create_optimizer(self, model: torch.nn.Module | None = None) -> torch.optim.Optimizer:
+        if self.optimizer is not None or self.scratchpad_learning_rate is None:
+            return super().create_optimizer(model)
+        opt_model = self.model if model is None else model
+        scratchpad_param_ids = {
+            id(module.trainable.weight)
+            for module in opt_model.modules()
+            if isinstance(module, TrainableTokenEmbedding)
+        }
+        if not scratchpad_param_ids:
+            return super().create_optimizer(model)
+
+        decay_parameters = self.get_decay_parameter_names(opt_model)
+        grouped: list[dict[str, Any]] = []
+
+        def add_group(params: list[torch.nn.Parameter], weight_decay: float, lr: float | None = None) -> None:
+            if not params:
+                return
+            group: dict[str, Any] = {"params": params, "weight_decay": weight_decay}
+            if lr is not None:
+                group["lr"] = lr
+            grouped.append(group)
+
+        add_group(
+            [
+                p
+                for n, p in opt_model.named_parameters()
+                if p.requires_grad and id(p) not in scratchpad_param_ids and n in decay_parameters
+            ],
+            self.args.weight_decay,
+        )
+        add_group(
+            [
+                p
+                for n, p in opt_model.named_parameters()
+                if p.requires_grad and id(p) not in scratchpad_param_ids and n not in decay_parameters
+            ],
+            0.0,
+        )
+        add_group(
+            [p for p in opt_model.parameters() if p.requires_grad and id(p) in scratchpad_param_ids],
+            0.0,
+            float(self.scratchpad_learning_rate),
+        )
+
+        if self.optimizer_cls_and_kwargs is not None:
+            optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+        else:
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+        optimizer_kwargs = dict(optimizer_kwargs)
+        optimizer_kwargs.pop("params", None)
+        optimizer_kwargs.pop("model", None)
+        optimizer_kwargs.pop("optimizer_dict", None)
+        self.optimizer = optimizer_cls(grouped, **optimizer_kwargs)
+        return self.optimizer
 
 
 def make_training_arguments(**kwargs: Any) -> TrainingArguments:
@@ -145,7 +210,12 @@ def main() -> None:
     parser.add_argument("--max-seq-len", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--grad-accum-steps", type=int, default=None)
+    parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--logging-steps", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--scratchpad-learning-rate", type=float, default=None)
+    parser.add_argument("--scratchpad-init-text", default=None)
     parser.add_argument("--sparse-attention-backend", choices=["eager_block", "flash_block", "sdpa_mask", "dense"], default=None)
     parser.add_argument("--base-attn-implementation", default=None)
     parser.add_argument(
@@ -172,6 +242,19 @@ def main() -> None:
         token_prefix=str(cfg_get(config, "scratchpad.token_prefix", "<scratchpad_")),
         token_suffix=str(cfg_get(config, "scratchpad.token_suffix", ">")),
     )
+    scratchpad_init_text = (
+        args.scratchpad_init_text
+        if args.scratchpad_init_text is not None
+        else cfg_get(config, "scratchpad.init_text", ".")
+    )
+    base_learning_rate = args.learning_rate or float(cfg_get(config, "train.learning_rate", 1.0e-5))
+    scratchpad_learning_rate = (
+        args.scratchpad_learning_rate
+        if args.scratchpad_learning_rate is not None
+        else cfg_get(config, "train.scratchpad_learning_rate", None)
+    )
+    if scratchpad_learning_rate is not None:
+        scratchpad_learning_rate = float(scratchpad_learning_rate)
     max_seq_len = args.max_seq_len or int(cfg_get(config, "data.max_seq_len", 4096))
     append_eos = bool(cfg_get(config, "data.append_eos_token", True))
     position_strategy = args.position_strategy or str(cfg_get(config, "train.position_strategy", "standard"))
@@ -207,6 +290,11 @@ def main() -> None:
     model = apply_lora(model, config)
     token_ids = [int(tokenizer.convert_tokens_to_ids(token)) for token in scratchpad_tokens]
     install_trainable_token_embeddings(model, token_ids)
+    if scratchpad_init_text:
+        init_token_ids = initialize_trainable_token_embeddings_from_text(model, tokenizer, str(scratchpad_init_text))
+        print(f"initialized scratchpad embeddings from {scratchpad_init_text!r} token ids {init_token_ids}")
+    else:
+        print("initialized scratchpad embeddings from resized special-token rows")
 
     if bool(cfg_get(config, "train.gradient_checkpointing", True)):
         model.gradient_checkpointing_enable()
@@ -245,13 +333,13 @@ def main() -> None:
         overwrite_output_dir=bool(cfg_get(config, "train.overwrite_output_dir", False)),
         per_device_train_batch_size=args.batch_size or int(cfg_get(config, "train.batch_size", 1)),
         per_device_eval_batch_size=int(cfg_get(config, "train.eval_batch_size", 1)),
-        gradient_accumulation_steps=int(cfg_get(config, "train.grad_accum_steps", 8)),
+        gradient_accumulation_steps=args.grad_accum_steps or int(cfg_get(config, "train.grad_accum_steps", 8)),
         max_steps=args.max_steps or int(cfg_get(config, "train.max_steps", 12_500)),
-        learning_rate=args.learning_rate or float(cfg_get(config, "train.learning_rate", 1.0e-5)),
+        learning_rate=base_learning_rate,
         weight_decay=float(cfg_get(config, "train.weight_decay", 0.0)),
-        warmup_steps=int(cfg_get(config, "train.warmup_steps", 100)),
+        warmup_steps=args.warmup_steps if args.warmup_steps is not None else int(cfg_get(config, "train.warmup_steps", 100)),
         max_grad_norm=float(cfg_get(config, "train.max_grad_norm", 1.0)),
-        logging_steps=int(cfg_get(config, "train.log_every", 10)),
+        logging_steps=args.logging_steps or int(cfg_get(config, "train.log_every", 10)),
         save_steps=int(cfg_get(config, "train.save_every", 1000)),
         eval_steps=int(cfg_get(config, "train.eval_every", 0)) or None,
         evaluation_strategy="steps" if eval_dataset is not None and int(cfg_get(config, "train.eval_every", 0)) > 0 else "no",
@@ -275,13 +363,20 @@ def main() -> None:
             else torch.float32
         ),
     )
-    trainer = Trainer(
+    print(f"base trainable LR: {base_learning_rate}")
+    if scratchpad_learning_rate is not None:
+        print(f"scratchpad token LR: {scratchpad_learning_rate}")
+    else:
+        print("scratchpad token LR: same as base trainable LR")
+
+    trainer = ScratchpadLrTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=collator,
         callbacks=[SaveScratchpadCallback(tokenizer, scratchpad_tokens)],
+        scratchpad_learning_rate=scratchpad_learning_rate,
     )
     trainer.train()
     trainer.save_model(output_dir)

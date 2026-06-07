@@ -120,6 +120,25 @@ def install_trainable_token_embeddings(model: nn.Module, token_ids: list[int]) -
     return wrapper
 
 
+def initialize_trainable_token_embeddings_from_text(
+    model: nn.Module,
+    tokenizer: Any,
+    init_text: str,
+) -> list[int]:
+    wrapper = find_trainable_token_embedding(model)
+    if wrapper is None:
+        raise ValueError("scratchpad embeddings must be installed before initialization")
+    init_ids = tokenizer.encode(init_text, add_special_tokens=False)
+    if not init_ids:
+        raise ValueError(f"scratchpad init text produced no tokens: {init_text!r}")
+    ids = torch.tensor(init_ids, dtype=torch.long, device=wrapper.base_embedding.weight.device)
+    with torch.no_grad():
+        source = wrapper.base_embedding(ids).to(torch.float32).mean(dim=0)
+        source = source.to(wrapper.trainable.weight.device, wrapper.trainable.weight.dtype)
+        wrapper.trainable.weight.copy_(source.unsqueeze(0).expand_as(wrapper.trainable.weight))
+    return [int(token_id) for token_id in init_ids]
+
+
 def find_trainable_token_embedding(model: nn.Module) -> TrainableTokenEmbedding | None:
     embedding = model.get_input_embeddings()
     if isinstance(embedding, TrainableTokenEmbedding):
@@ -180,6 +199,30 @@ def load_tokenizer(path: str, fallback_path: str | None = None) -> Any:
     return tokenizer
 
 
+def checkpoint_scratchpad_tokens(checkpoint_dir: str | Path | None) -> list[str]:
+    if checkpoint_dir is None:
+        return []
+    config_path = Path(checkpoint_dir) / SCRATCHPAD_CONFIG_FILE
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        return list(state.get("tokens", []))
+    embeddings_path = Path(checkpoint_dir) / SCRATCHPAD_EMBEDDINGS_FILE
+    if embeddings_path.exists():
+        state = torch.load(embeddings_path, map_location="cpu")
+        return list(state.get("tokens", []))
+    return []
+
+
+def ensure_tokenizer_tokens(tokenizer: Any, tokens: list[str]) -> None:
+    if not tokens:
+        return
+    existing = set(tokenizer.get_vocab())
+    to_add = [token for token in tokens if token not in existing]
+    if to_add:
+        tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+
+
 def load_causal_lm(
     model_name_or_path: str,
     dtype: str | None = "bfloat16",
@@ -223,6 +266,7 @@ def load_model_for_eval(
     adapter_config = checkpoint_path / "adapter_config.json" if checkpoint_path else None
     tokenizer_path = str(checkpoint_path) if checkpoint_path and (checkpoint_path / "tokenizer_config.json").exists() else base_model
     tokenizer = load_tokenizer(tokenizer_path, fallback_path=base_model)
+    ensure_tokenizer_tokens(tokenizer, checkpoint_scratchpad_tokens(checkpoint_path))
 
     if adapter_config and adapter_config.exists():
         model = load_causal_lm(
