@@ -84,12 +84,15 @@ def qwen_attention_prefill_prefix(
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ):
+    if past_key_value is None:
+        past_key_value = kwargs.get("past_key_values", None)
     bsz, q_len, _ = hidden_states.size()
     query_states, key_states, value_states = _shape_qkv(self, hidden_states)
     query_states, key_states = _apply_rope(
         self, query_states, key_states, value_states, position_ids, position_embeddings
     )
     past_key_value = (key_states, value_states, position_ids) if use_cache else None
+    self._ape_last_past_key_value = past_key_value
     self.len_prefix = q_len
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -99,9 +102,9 @@ def qwen_attention_prefill_prefix(
         value_states.transpose(1, 2),
         causal=q_len > 1,
     )
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = attn_output.reshape(bsz, q_len, -1)
     attn_output = self.o_proj(attn_output)
-    return attn_output, None if not output_attentions else None, past_key_value
+    return attn_output, None if not output_attentions else None
 
 
 def qwen_attention_prefill_context(
@@ -116,6 +119,8 @@ def qwen_attention_prefill_context(
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ):
+    if past_key_value is None:
+        past_key_value = kwargs.get("past_key_values", None)
     bsz, q_len, _ = hidden_states.size()
     query_states, key_states, value_states = _shape_qkv(self, hidden_states)
     query_states, key_states = _apply_rope(
@@ -127,6 +132,7 @@ def qwen_attention_prefill_context(
     value_states = torch.cat([past_value, value_states], dim=2)
     position_states = torch.cat([past_position, position_ids], dim=-1)
     past_key_value = (key_states, value_states, position_states) if use_cache else None
+    self._ape_last_past_key_value = past_key_value
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
     attn_output = flash_attn_func(
@@ -135,9 +141,9 @@ def qwen_attention_prefill_context(
         value_states.transpose(1, 2),
         causal=q_len > 1,
     )
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = attn_output.reshape(bsz, q_len, -1)
     attn_output = self.o_proj(attn_output)
-    return attn_output, None if not output_attentions else None, past_key_value
+    return attn_output, None if not output_attentions else None
 
 
 def qwen_attention_prefill_query(
@@ -155,6 +161,8 @@ def qwen_attention_prefill_query(
     position_shift: int = 0,
     **kwargs,
 ):
+    if past_key_value is None:
+        past_key_value = kwargs.get("past_key_values", None)
     bsz, q_len, _ = hidden_states.size()
     query_states, key_states, value_states = _shape_qkv(self, hidden_states)
     assert past_key_value is not None
@@ -164,7 +172,7 @@ def qwen_attention_prefill_query(
         self.len_context = past_key.shape[2] - self.len_prefix
     else:
         past_key, past_value, past_position = past_key_value
-        current_position = past_position.max().item() + 1 + int(position_shift)
+        current_position = past_position.max().item() + 1
     key_position_ids = position_ids - position_ids.min().item() + current_position
     query_states, key_states = _apply_rope(
         self, query_states, key_states, value_states, key_position_ids, position_embeddings
@@ -173,6 +181,7 @@ def qwen_attention_prefill_query(
     value_states = torch.cat([past_value, value_states], dim=2)
     position_states = torch.cat([past_position, key_position_ids], dim=-1)
     past_key_value = (key_states, value_states, position_states) if use_cache else None
+    self._ape_last_past_key_value = past_key_value
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -209,9 +218,9 @@ def qwen_attention_prefill_query(
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
     value_states = torch.cat([attn_output_context.unsqueeze(-2), attn_output_other.unsqueeze(-2)], dim=-2)
     attn_output = torch.matmul(attn_weights, value_states).squeeze(dim=-2)
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = attn_output.reshape(bsz, q_len, -1)
     attn_output = self.o_proj(attn_output)
-    return attn_output, None if not output_attentions else attn_weights, past_key_value
+    return attn_output, None if not output_attentions else attn_weights
 
 
 def qwen_forward(
@@ -242,7 +251,17 @@ def qwen_forward(
             device=inputs_embeds.device,
         )
     if position_ids is None:
-        position_ids = cache_position.unsqueeze(0)
+        if past_key_values is not None and past_key_values and len(past_key_values[0]) in {3, 4}:
+            past_position = past_key_values[0][2]
+            position_shift = int(getattr(self, "_ape_query_position_shift", 0)) if len(past_key_values[0]) == 4 else 0
+            position_start = int(past_position.max().item()) + 1 + position_shift
+            position_ids = torch.arange(
+                position_start,
+                position_start + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            ).unsqueeze(0)
+        else:
+            position_ids = cache_position.unsqueeze(0)
     causal_mask = None
     if hasattr(self, "_update_causal_mask"):
         try:
@@ -271,12 +290,17 @@ def qwen_forward(
         )
         if isinstance(layer_outputs, tuple):
             hidden_states = layer_outputs[0]
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
         else:
             hidden_states = layer_outputs
+        if use_cache:
+            layer_cache = getattr(getattr(decoder_layer, "self_attn", None), "_ape_last_past_key_value", None)
+            if layer_cache is None and isinstance(layer_outputs, tuple) and len(layer_outputs) > 2:
+                layer_cache = layer_outputs[2 if output_attentions else 1]
+            if layer_cache is None:
+                raise RuntimeError("Qwen APE attention did not produce a cache entry")
+            next_decoder_cache += (layer_cache,)
     hidden_states = self.norm(hidden_states)
     if output_hidden_states:
         all_hidden_states += (hidden_states,)
@@ -321,3 +345,7 @@ def enable_qwen_attention_prefill_query(model, temperature, scale, position_shif
             position_shift=position_shift,
         ),
     )
+    if QWEN_MODEL_CLASSES:
+        for module in model.modules():
+            if isinstance(module, QWEN_MODEL_CLASSES):
+                module._ape_query_position_shift = int(position_shift)

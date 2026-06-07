@@ -133,7 +133,6 @@ eval:
   # For Qwen checkpoints, keep this as qwen. For Llama/Mistral/Gemma, set a
   # short family string such as llama3-8b-instruct to match APE chat wrapping.
   ape_model_name: qwen
-  question_position_gap: 512
 
 litm:
   data_dir: data/litm_nq

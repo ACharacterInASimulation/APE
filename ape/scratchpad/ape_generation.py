@@ -61,7 +61,8 @@ def generate_with_ape(
     arguments are inference-only, so training remains ordinary causal LM SFT.
     """
 
-    tokenizer.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
     prefix = wrap_prefix(model_name, build_prefix_field(example))
     query = wrap_query(
         model_name,
@@ -132,10 +133,6 @@ def generate_with_ape(
         )
         merged_cache.append((past_key, past_value, past_position, len(contexts)))
 
-    flattened_context_ids = context_ids.flatten()[context_mask_cpu].unsqueeze(0)
-    input_ids = torch.cat([prefix_ids, flattened_context_ids.cpu(), query_ids], dim=-1)
-    context_length = input_ids.shape[-1]
-
     enable_attention_prefill_query(
         model_name,
         model,
@@ -143,13 +140,30 @@ def generate_with_ape(
         float(scale),
         position_shift=int(query_position_shift),
     )
-    output = model.generate(
-        input_ids=input_ids.to(model.device),
-        max_new_tokens=int(max_new_tokens),
-        num_beams=1,
-        do_sample=False,
-        temperature=1.0,
+    outputs = model(
+        input_ids=query_ids.to(model.device),
         past_key_values=merged_cache,
-        cache_implementation=None,
-    )[0]
-    return tokenizer.decode(output[context_length:], skip_special_tokens=True).strip()
+        use_cache=True,
+        return_dict=True,
+    )
+    past_key_values = outputs.past_key_values
+    next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    eos_token_id = tokenizer.eos_token_id
+    generated = []
+    for _ in range(int(max_new_tokens)):
+        token_id = int(next_token[0, 0].item())
+        if eos_token_id is not None and token_id == int(eos_token_id):
+            break
+        generated.append(next_token)
+        outputs = model(
+            input_ids=next_token,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = outputs.past_key_values
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    if not generated:
+        return ""
+    output = torch.cat(generated, dim=-1)[0]
+    return tokenizer.decode(output, skip_special_tokens=True).strip()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate normal decoder and trained scratchpad checkpoint variants."""
+"""Evaluate normal decoder, base APE, and trained scratchpad checkpoint variants."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from ape.scratchpad.data import load_examples_from_jsonl, open_text  # noqa: E40
 from ape.scratchpad.metrics import mean_metrics, score_qa  # noqa: E402
 from ape.scratchpad.modeling import greedy_generate, load_model_for_eval  # noqa: E402
 from ape.scratchpad.rendering import (  # noqa: E402
-    DEFAULT_QUESTION_POSITION_GAP,
     DEFAULT_SCRATCHPAD_LEN,
     build_context_fields,
     build_prefix_field,
@@ -34,6 +33,10 @@ from ape.scratchpad.rendering import (  # noqa: E402
 
 ALL_METHODS = [
     "decoder",
+    "ape_scaled",
+    "ape_scaled_pos64",
+    "ape_scaled_pos128",
+    "ape_scaled_pos512",
     "scratchpad_noscale",
     "scratchpad_scaled",
     "scratchpad_scaled_pos512",
@@ -191,6 +194,28 @@ def should_evaluate_pair(
     return True
 
 
+def method_uses_scratchpad(method: str) -> bool:
+    return method.startswith("scratchpad_")
+
+
+def method_uses_ape(method: str) -> bool:
+    return method.startswith("ape_") or method_uses_scratchpad(method)
+
+
+def method_uses_scaling(method: str) -> bool:
+    return method.startswith("ape_scaled") or method.startswith("scratchpad_scaled")
+
+
+def method_position_shift(method: str) -> int:
+    fixed_shifts = {
+        "ape_scaled_pos64": 64,
+        "ape_scaled_pos128": 128,
+        "ape_scaled_pos512": 512,
+        "scratchpad_scaled_pos512": 512,
+    }
+    return int(fixed_shifts.get(method, 0))
+
+
 @torch.no_grad()
 def generate_decoder(
     model: Any,
@@ -281,7 +306,6 @@ def main() -> None:
     parser.add_argument("--ape-model-name", default=None)
     parser.add_argument("--ape-temperature", type=float, default=None)
     parser.add_argument("--ape-scale", type=float, default=None)
-    parser.add_argument("--question-position-gap", type=int, default=None)
     args = parser.parse_args()
 
     config = read_yaml(args.config)
@@ -297,9 +321,6 @@ def main() -> None:
     ape_temperature = args.ape_temperature if args.ape_temperature is not None else float(cfg_get(config, "eval.ape_temperature", 0.9))
     ape_scale = args.ape_scale if args.ape_scale is not None else float(cfg_get(config, "eval.ape_scale", 0.9))
     ape_model_name = args.ape_model_name or str(cfg_get(config, "eval.ape_model_name", base_model)).lower()
-    question_position_gap = args.question_position_gap or int(
-        cfg_get(config, "eval.question_position_gap", DEFAULT_QUESTION_POSITION_GAP)
-    )
     method_config = cfg_get(config, "eval.methods", ALL_METHODS)
     method_string = args.methods if args.methods else ",".join(parse_config_csv(method_config))
     methods = expand_methods(method_string)
@@ -337,7 +358,15 @@ def main() -> None:
     all_rows = []
 
     for method in methods:
-        method_checkpoint = args.decoder_checkpoint if method == "decoder" else args.checkpoint
+        if method_uses_scratchpad(method) and args.checkpoint is None:
+            raise ValueError(f"{method} requires --checkpoint pointing to the trained scratchpad checkpoint")
+        method_checkpoint = (
+            args.decoder_checkpoint
+            if method == "decoder"
+            else args.checkpoint
+            if method_uses_scratchpad(method)
+            else None
+        )
         tokenizer, model = load_model_for_eval(
             base_model=base_model,
             checkpoint=method_checkpoint,
@@ -348,10 +377,10 @@ def main() -> None:
         )
         if cfg_get(config, "model.device_map", None) is None:
             model = model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-        scaled = method in {"scratchpad_scaled", "scratchpad_scaled_pos512"}
+        scaled = method_uses_scaling(method)
         temp = ape_temperature if scaled else 1.0
         scale = ape_scale if scaled else 1.0
-        query_position_shift = question_position_gap if method == "scratchpad_scaled_pos512" else 0
+        query_position_shift = method_position_shift(method)
         for variant, example in tqdm(example_pairs, desc=method, dynamic_ncols=True):
             if not should_evaluate_pair(method, variant, example, parallel_litm_positions):
                 continue
@@ -363,19 +392,21 @@ def main() -> None:
                     max_new_tokens=max_new_tokens,
                     max_context_tokens=max_context_tokens,
                 )
-            else:
+            elif method_uses_ape(method):
                 prediction = generate_with_ape(
                     model=model,
                     tokenizer=tokenizer,
                     model_name=ape_model_name,
                     example=example,
-                    scratchpad_tokens=scratchpad_tokens,
+                    scratchpad_tokens=scratchpad_tokens if method_uses_scratchpad(method) else None,
                     temperature=temp,
                     scale=scale,
                     max_new_tokens=max_new_tokens,
                     max_context_tokens=max_context_tokens,
                     query_position_shift=query_position_shift,
                 )
+            else:
+                raise ValueError(f"Unsupported method: {method}")
             metrics = score_qa(prediction, list(example.get("answers", [])))
             row = {
                 "method": method,

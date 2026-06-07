@@ -41,7 +41,7 @@ This checkout also includes a lightweight SFT/eval path for positional-bias rese
 - the default `flash_block` backend issues FlashAttention calls per block; `sdpa_mask` is available as a correctness fallback
 - includes a dense causal decoder-only SFT baseline on the same JSONL data with `flash_attention_2`
 - renders prompts as APE fields: `prefix`, parallel `contexts`, then `query`
-- evaluates a normal causal `decoder` baseline plus trained scratchpad-checkpoint variants: `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512`
+- evaluates base APE scaled variants, a normal causal `decoder` baseline, and trained scratchpad-checkpoint variants: `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512`
 - supports the LITM NaturalQuestions start/middle/end setup for the causal decoder baseline; parallel methods run a single representative LITM position by default
 - keeps the requested multi-hop mix in the materialized JSONL path; the original APE experiments only partially cover this set directly
 
@@ -99,6 +99,23 @@ python scripts/eval_scratchpad.py \
 By default, `decoder` loads the base model even when `--checkpoint` is supplied for the scratchpad methods. To evaluate the trained dense decoder baseline, pass `--decoder-checkpoint outputs/decoder_multihop_qwen3_1_7b`.
 
 The `scratchpad_scaled_pos512` method applies the ablation where query/scratch/answer positions start at `prefix_len + max_doc_len + 512` inside APE query prefill.
+
+For longer eval runs, use the suite wrappers after preparing `data/scratchpad_multihop/eval.jsonl` and downloading LITM:
+
+```bash
+scripts/run_ape_eval_suite.sh \
+  --input-jsonl data/scratchpad_multihop/eval.jsonl \
+  --litm-dir data/litm_nq
+
+scripts/run_scratchpad_eval_suite.sh \
+  --checkpoint outputs/scratchpad_multihop_qwen3_1_7b \
+  --input-jsonl data/scratchpad_multihop/eval.jsonl \
+  --litm-dir data/litm_nq
+```
+
+`run_ape_eval_suite.sh` runs `ape_scaled`, `ape_scaled_pos64`, `ape_scaled_pos128`, `ape_scaled_pos512`, and `decoder`. The decoder gets LITM `start,middle,end`; APE methods use the representative `--parallel-litm-positions start`.
+
+`run_scratchpad_eval_suite.sh` runs `scratchpad_noscale`, `scratchpad_scaled`, and `scratchpad_scaled_pos512` from the trained checkpoint, with multi-hop `as_is` and representative LITM by default.
 
 ## TODOs
 We will release the code and data in the following order, please stay tuned!

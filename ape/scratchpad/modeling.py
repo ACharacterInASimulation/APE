@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,18 @@ class TrainableTokenEmbedding(nn.Module):
 
     def scratchpad_weight(self) -> torch.Tensor:
         return self.trainable.weight.detach()
+
+    def state_dict(self, destination=None, prefix: str = "", keep_vars: bool = False):  # type: ignore[override]
+        if destination is None:
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()  # type: ignore[attr-defined]
+        base_weight = self.base_embedding.weight if keep_vars else self.base_embedding.weight.detach()
+        trainable_weight = self.trainable.weight if keep_vars else self.trainable.weight.detach()
+        merged_weight = base_weight.clone()
+        token_ids = torch.tensor(self.token_ids, dtype=torch.long, device=merged_weight.device)
+        merged_weight[token_ids] = trainable_weight.to(merged_weight.device, merged_weight.dtype)
+        destination[prefix + "weight"] = merged_weight
+        return destination
 
 
 def install_trainable_token_embeddings(model: nn.Module, token_ids: list[int]) -> TrainableTokenEmbedding:

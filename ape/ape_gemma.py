@@ -157,7 +157,7 @@ def gemma_attention_prefill_query(
         self.len_context = past_key.shape[2] - self.len_prefix
     else:
         (past_key, past_value, past_position) = past_key_value
-        current_position = past_position.max().item() + 1 + int(position_shift)
+        current_position = past_position.max().item() + 1
 
     key_position_ids = position_ids - position_ids.min().item() + current_position
 
