@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,12 +45,11 @@ def cfg_get(config: dict[str, Any], dotted: str, default: Any = None) -> Any:
 
 
 def make_training_arguments(**kwargs: Any) -> TrainingArguments:
-    try:
-        return TrainingArguments(**kwargs)
-    except TypeError:
-        if "evaluation_strategy" in kwargs:
-            kwargs["eval_strategy"] = kwargs.pop("evaluation_strategy")
-        return TrainingArguments(**kwargs)
+    parameters = inspect.signature(TrainingArguments).parameters
+    if "evaluation_strategy" in kwargs and "evaluation_strategy" not in parameters and "eval_strategy" in parameters:
+        kwargs["eval_strategy"] = kwargs.pop("evaluation_strategy")
+    supported = {key: value for key, value in kwargs.items() if key in parameters}
+    return TrainingArguments(**supported)
 
 
 def apply_lora(model: torch.nn.Module, config: dict[str, Any]) -> torch.nn.Module:

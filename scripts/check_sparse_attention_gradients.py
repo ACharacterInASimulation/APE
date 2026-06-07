@@ -134,36 +134,61 @@ def tiny_qwen_model() -> torch.nn.Module:
     return model
 
 
-def make_batches(device: torch.device) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
-    item = {
-        "input_ids": [11, 12, 21, 22, 23, 31, 32, 41, 42, 43],
-        "attention_mask": [1] * 10,
-        "position_ids": [0, 1, 2, 3, 4, 2, 3, 5, 6, 7],
-        "segment_ids": [
-            SEGMENT_PREFIX,
-            SEGMENT_PREFIX,
-            SEGMENT_DOC_START,
-            SEGMENT_DOC_START,
-            SEGMENT_DOC_START,
-            SEGMENT_DOC_START + 1,
-            SEGMENT_DOC_START + 1,
-            SEGMENT_SUFFIX,
-            SEGMENT_SUFFIX,
-            SEGMENT_SUFFIX,
-        ],
-        "labels": [-100, -100, -100, -100, -100, -100, -100, 51, 52, 53],
+def make_item(prefix_len: int, context_lens: list[int], suffix_len: int, offset: int) -> dict[str, list[int]]:
+    token = 10 + int(offset)
+    input_ids: list[int] = []
+    segment_ids: list[int] = []
+    input_ids.extend(range(token, token + prefix_len))
+    segment_ids.extend([SEGMENT_PREFIX] * prefix_len)
+    token += prefix_len
+    for doc_index, context_len in enumerate(context_lens):
+        input_ids.extend(range(token, token + context_len))
+        segment_ids.extend([SEGMENT_DOC_START + doc_index] * context_len)
+        token += context_len
+    input_ids.extend(range(token, token + suffix_len))
+    segment_ids.extend([SEGMENT_SUFFIX] * suffix_len)
+    labels = [-100] * (len(input_ids) - suffix_len) + list(range(80 + offset, 80 + offset + suffix_len))
+    return {
+        "input_ids": [int(token_id % 127) for token_id in input_ids],
+        "attention_mask": [1] * len(input_ids),
+        "position_ids": _ape_parallel_position_ids(prefix_len, context_lens, suffix_len, gap=0),
+        "segment_ids": segment_ids,
+        "labels": [int(label % 127) if label != -100 else -100 for label in labels],
     }
-    ref_batch = ScratchpadCollator(pad_token_id=0, sparse_attention_backend="sdpa_mask")([item])
-    flash_batch = ScratchpadCollator(pad_token_id=0, sparse_attention_backend="flash_block")([item])
+
+
+def make_batches(
+    device: torch.device,
+    sdpa_mask_dtype: torch.dtype,
+    batch_size: int,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    patterns = [
+        (2, [3, 2], 3),
+        (3, [2, 4, 1], 4),
+        (1, [1, 3], 2),
+        (4, [2, 1, 2], 3),
+    ]
+    items = [
+        make_item(*patterns[index % len(patterns)], offset=7 * index)
+        for index in range(int(batch_size))
+    ]
+    ref_batch = ScratchpadCollator(
+        pad_token_id=0,
+        pad_to_multiple_of=8,
+        sparse_attention_backend="sdpa_mask",
+        sdpa_mask_dtype=sdpa_mask_dtype,
+    )(items)
+    flash_batch = ScratchpadCollator(
+        pad_token_id=0,
+        pad_to_multiple_of=8,
+        sparse_attention_backend="flash_block",
+    )(items)
     for batch in (ref_batch, flash_batch):
         for key, value in list(batch.items()):
             batch[key] = value.to(device)
-    suffix_positions = torch.tensor(
-        [idx for idx, segment in enumerate(item["segment_ids"]) if segment == SEGMENT_SUFFIX],
-        dtype=torch.long,
-        device=device,
-    )
-    return ref_batch, flash_batch, suffix_positions
+    real_mask = flash_batch["segment_ids"] != SEGMENT_PAD
+    suffix_mask = flash_batch["segment_ids"] == SEGMENT_SUFFIX
+    return ref_batch, flash_batch, real_mask, suffix_mask
 
 
 def run_forward_backward(model: torch.nn.Module, batch: dict[str, torch.Tensor]) -> Any:
@@ -206,9 +231,10 @@ def flash_available() -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--atol", type=float, default=2.0e-5)
+    parser.add_argument("--atol", type=float, default=None)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--fake-flash", action="store_true", help="Use a CPU-compatible fake flash_attn_func.")
     parser.add_argument("--real-flash", action="store_true", help="Require an installed flash-attn backend.")
     args = parser.parse_args()
@@ -229,33 +255,42 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() and not use_fake_flash else "cpu")
     else:
         device = torch.device(args.device)
+    if not use_fake_flash and device.type != "cuda":
+        raise RuntimeError("Real flash-attn checks require a CUDA device")
+    model_dtype = torch.bfloat16 if not use_fake_flash else torch.float32
+    tolerance = float(args.atol) if args.atol is not None else (5.0e-2 if not use_fake_flash else 2.0e-5)
+    print(f"device: {device}, dtype: {model_dtype}, tolerance: {tolerance:.8g}")
     torch.manual_seed(int(args.seed))
-    reference = tiny_qwen_model().to(device)
-    candidate = copy.deepcopy(reference).to(device)
+    reference = tiny_qwen_model().to(device=device, dtype=model_dtype)
+    candidate = copy.deepcopy(reference).to(device=device, dtype=model_dtype)
     installed = install_qwen_block_sparse_attention(candidate)
     if installed <= 0:
         raise RuntimeError("No Qwen attention layers were patched for flash_block")
 
-    ref_batch, flash_batch, suffix_positions = make_batches(device)
+    ref_batch, flash_batch, real_mask, suffix_mask = make_batches(
+        device,
+        sdpa_mask_dtype=model_dtype,
+        batch_size=max(1, int(args.batch_size)),
+    )
     ref_output = run_forward_backward(reference, ref_batch)
     cand_output = run_forward_backward(candidate, flash_batch)
 
     loss_diff = abs(float(ref_output.loss.detach().float()) - float(cand_output.loss.detach().float()))
-    all_logits_diff = max_abs(ref_output.logits, cand_output.logits)
+    all_logits_diff = max_abs(ref_output.logits[real_mask], cand_output.logits[real_mask])
     suffix_logits_diff = max_abs(
-        ref_output.logits.index_select(1, suffix_positions),
-        cand_output.logits.index_select(1, suffix_positions),
+        ref_output.logits[suffix_mask],
+        cand_output.logits[suffix_mask],
     )
     hidden_diff = 0.0
     for ref_hidden, cand_hidden in zip(ref_output.hidden_states, cand_output.hidden_states):
-        hidden_diff = max(hidden_diff, max_abs(ref_hidden, cand_hidden))
+        hidden_diff = max(hidden_diff, max_abs(ref_hidden[real_mask], cand_hidden[real_mask]))
     grad_diff, grad_name = compare_gradients(reference, candidate)
 
-    assert_close("loss diff", loss_diff, args.atol)
-    assert_close("all logits max diff", all_logits_diff, args.atol)
-    assert_close("suffix logits max diff", suffix_logits_diff, args.atol)
-    assert_close("hidden states max diff", hidden_diff, args.atol)
-    assert_close(f"parameter gradients max diff ({grad_name or 'none'})", grad_diff, args.atol)
+    assert_close("loss diff", loss_diff, tolerance)
+    assert_close("all logits max diff", all_logits_diff, tolerance)
+    assert_close("suffix logits max diff", suffix_logits_diff, tolerance)
+    assert_close("hidden states max diff", hidden_diff, tolerance)
+    assert_close(f"parameter gradients max diff ({grad_name or 'none'})", grad_diff, tolerance)
     print("sparse attention gradient equivalence: ok")
 
 
