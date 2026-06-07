@@ -1,0 +1,138 @@
+run_name: scratchpad_multihop
+seed: 42
+output_dir: outputs/scratchpad_multihop_qwen3_1_7b
+
+model:
+  name_or_path: Qwen/Qwen3-1.7B
+  dtype: bfloat16
+  # Dense attention implementation used only when train.sparse_attention_backend=dense.
+  attn_implementation: flash_attention_2
+  load_in_4bit: false
+  device_map: null
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+scratchpad:
+  # User-requested trained scratchpad/gist prefix length.
+  length: 32
+  token_prefix: <scratchpad_
+  token_suffix: >
+
+data:
+  output_dir: data/scratchpad_multihop
+  train_jsonl: data/scratchpad_multihop/train.jsonl
+  eval_jsonl: data/scratchpad_multihop/eval.jsonl
+  instruction: Use the provided contexts to answer the question.
+  min_docs: 2
+  max_docs: all
+  max_doc_tokens: 512
+  max_seq_len: 4096
+  pad_to_multiple_of: 8
+  examples_per_source: 20000
+  eval_examples_per_source: 1000
+  append_eos_token: true
+  sources:
+    - name: hotpotqa
+      kind: context_qa
+      hf_path: hotpotqa/hotpot_qa
+      hf_config: fullwiki
+      train_split: train
+      eval_split: validation
+    - name: 2wikimultihopqa
+      kind: context_qa
+      hf_path: voidful/2WikiMultihopQA
+      hf_config: default
+      train_split: train
+      eval_split: validation
+    - name: musique
+      kind: musique
+      hf_path: dgslibisey/MuSiQue
+      train_split: train
+      eval_split: validation
+    - name: wikihop
+      kind: qangaroo
+      hf_path: community-datasets/qangaroo
+      hf_config: wikihop
+      train_split: train
+      eval_split: validation
+      streaming: false
+    - name: msmarco
+      kind: msmarco
+      hf_path: microsoft/ms_marco
+      hf_config: v2.1
+      train_split: train
+      eval_split: validation
+    - name: triviaqa
+      kind: triviaqa
+      hf_path: mandarjoshi/trivia_qa
+      hf_config: rc
+      train_split: train
+      eval_split: validation
+
+train:
+  # Default training attention is APE-style block sparse:
+  # prefix/doc_i streams are isolated from other docs, while query/scratch/answer
+  # attend prefix plus every document. flash_block uses flash_attn_func calls per
+  # block; sdpa_mask is a correctness fallback with a 4D mask.
+  sparse_attention_backend: flash_block
+  base_attn_implementation: sdpa
+  batch_size: 1
+  eval_batch_size: 1
+  grad_accum_steps: 8
+  max_steps: 12500
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  # Training uses ordinary causal LM loss. APE scaling is intentionally eval-only.
+  gradient_checkpointing: true
+  dataloader_num_workers: 0
+  dataloader_pin_memory: true
+  log_every: 10
+  save_every: 1000
+  eval_every: 0
+  report_to: []
+  max_train_examples: null
+  max_eval_examples: null
+  # standard/ape_parallel: prefix normal, every doc reuses the same post-prefix
+  # position band, and query/scratch/answer start after prefix + max_doc_len.
+  # question_after_docs_plus_gap/ape_parallel_pos512 adds question_position_gap
+  # only to the query/scratch/answer start.
+  position_strategy: standard
+  question_position_gap: 512
+
+eval:
+  methods:
+    - decoder
+    - scratchpad_noscale
+    - scratchpad_scaled
+    - scratchpad_scaled_pos512
+  max_new_tokens: 64
+  ape_temperature: 0.9
+  ape_scale: 0.9
+  # For Qwen checkpoints, keep this as qwen. For Llama/Mistral/Gemma, set a
+  # short family string such as llama3-8b-instruct to match APE chat wrapping.
+  ape_model_name: qwen
+  question_position_gap: 512
+
+litm:
+  data_dir: data/litm_nq
+  document_counts:
+    - 10
+    - 20
+    - 30
+  positions:
+    - start
+    - middle
+    - end

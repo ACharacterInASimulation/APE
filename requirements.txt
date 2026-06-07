@@ -1,0 +1,15 @@
+accelerate
+datasets
+ninja
+packaging
+peft
+pyyaml
+sentencepiece
+torch
+transformers
+tqdm
+
+# Required for APE inference and scratchpad flash_block training. Install a
+# wheel compatible with the local CUDA/PyTorch build if plain pip resolution
+# tries to build from source or imports an incompatible extension.
+flash-attn>=2.5.8

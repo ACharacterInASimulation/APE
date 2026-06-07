@@ -130,6 +130,7 @@ def llama_attention_prefill_query(
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
     temperature=1,
     scale=1,
+    position_shift=0,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     bsz, q_len, _ = hidden_states.size()
@@ -146,11 +147,11 @@ def llama_attention_prefill_query(
 
     if len(past_key_value) == 4:
         past_key, past_value, past_position = past_key_value[0], past_key_value[1], past_key_value[2]
-        current_position = past_position.max().item() + 1
+        current_position = past_position.max().item() + 1 + int(position_shift)
         self.len_context = past_key.shape[2] - self.len_prefix
     else:
         (past_key, past_value, past_position) = past_key_value
-        current_position = past_position.max().item() + 1
+        current_position = past_position.max().item() + 1 + int(position_shift)
 
     key_position_ids = position_ids - position_ids.min().item() + current_position
 
@@ -329,14 +330,20 @@ def enable_llama_attention_prefill_context(model):
                 llama_attention_prefill_context, model._modules[name]
             )
 
-def enable_llama_attention_prefill_query(model, temperature, scale):
+def enable_llama_attention_prefill_query(model, temperature, scale, position_shift=0):
     for name, module in reversed(model._modules.items()):
         if len(list(module.children())) > 0:
             enable_llama_attention_prefill_query(
-                module, temperature, scale
+                module, temperature, scale, position_shift=position_shift
             )
 
         if isinstance(module, LlamaAttention):
             model._modules[name].forward = types.MethodType(
-                partial(llama_attention_prefill_query, temperature=temperature, scale=scale), model._modules[name]
+                partial(
+                    llama_attention_prefill_query,
+                    temperature=temperature,
+                    scale=scale,
+                    position_shift=position_shift,
+                ),
+                model._modules[name],
             )

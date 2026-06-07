@@ -1,0 +1,14 @@
+accelerate
+datasets
+ninja
+packaging
+peft
+pyyaml
+sentencepiece
+torch
+transformers
+tqdm
+
+# Required for APE inference variants. Install a wheel compatible with your
+# local CUDA/PyTorch build if plain pip resolution fails.
+flash-attn>=2.5.8
