@@ -181,9 +181,20 @@ def load_scratchpad_state(model: nn.Module, tokenizer: Any, checkpoint_dir: str 
     token_ids = [int(tokenizer.convert_tokens_to_ids(token)) for token in tokens]
     weights = state["embeddings"]
     embedding = model.get_input_embeddings()
+    wrapper = find_trainable_token_embedding(model)
     with torch.no_grad():
-        for slot, token_id in enumerate(token_ids):
-            embedding.weight[int(token_id)].copy_(weights[slot].to(embedding.weight.device, embedding.weight.dtype))
+        if wrapper is not None:
+            slot_by_token_id = {int(token_id): slot for slot, token_id in enumerate(wrapper.token_ids)}
+            for saved_slot, token_id in enumerate(token_ids):
+                if int(token_id) not in slot_by_token_id:
+                    raise ValueError(f"checkpoint scratchpad token id {token_id} is not installed in the trainable wrapper")
+                target_slot = slot_by_token_id[int(token_id)]
+                wrapper.trainable.weight[target_slot].copy_(
+                    weights[saved_slot].to(wrapper.trainable.weight.device, wrapper.trainable.weight.dtype)
+                )
+        else:
+            for slot, token_id in enumerate(token_ids):
+                embedding.weight[int(token_id)].copy_(weights[slot].to(embedding.weight.device, embedding.weight.dtype))
     if getattr(model.config, "tie_word_embeddings", False) and hasattr(model, "tie_weights"):
         model.tie_weights()
 

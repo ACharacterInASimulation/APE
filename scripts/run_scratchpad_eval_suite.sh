@@ -10,6 +10,7 @@ BASE_MODEL=""
 CHECKPOINT=""
 TRAIN_JSONL=""
 TRAIN_EVAL_JSONL=""
+TRAIN_RESUME_FROM_CHECKPOINT=""
 TRAIN_MAX_STEPS=""
 TRAIN_BATCH_SIZE=""
 TRAIN_GRAD_ACCUM_STEPS=""
@@ -119,6 +120,7 @@ Options:
   --force-train                  train even if checkpoint already exists
   --train-jsonl PATH
   --train-eval-jsonl PATH
+  --train-resume-from-checkpoint PATH|last
   --train-max-steps N
   --train-batch-size N
   --train-grad-accum-steps N
@@ -160,6 +162,7 @@ while [[ $# -gt 0 ]]; do
     --force-train) FORCE_TRAIN=1; shift ;;
     --train-jsonl) TRAIN_JSONL="$2"; shift 2 ;;
     --train-eval-jsonl) TRAIN_EVAL_JSONL="$2"; shift 2 ;;
+    --train-resume-from-checkpoint) TRAIN_RESUME_FROM_CHECKPOINT="$2"; shift 2 ;;
     --train-max-steps) TRAIN_MAX_STEPS="$2"; shift 2 ;;
     --train-batch-size) TRAIN_BATCH_SIZE="$2"; shift 2 ;;
     --train-grad-accum-steps) TRAIN_GRAD_ACCUM_STEPS="$2"; shift 2 ;;
@@ -233,6 +236,7 @@ train_cmd=(
 [[ -n "$BASE_MODEL" ]] && train_cmd+=(--model "$BASE_MODEL")
 [[ -n "$TRAIN_JSONL" ]] && train_cmd+=(--train-jsonl "$TRAIN_JSONL")
 [[ -n "$TRAIN_EVAL_JSONL" ]] && train_cmd+=(--eval-jsonl "$TRAIN_EVAL_JSONL")
+[[ -n "$TRAIN_RESUME_FROM_CHECKPOINT" ]] && train_cmd+=(--resume-from-checkpoint "$TRAIN_RESUME_FROM_CHECKPOINT")
 [[ -n "$TRAIN_MAX_STEPS" ]] && train_cmd+=(--max-steps "$TRAIN_MAX_STEPS")
 [[ -n "$TRAIN_BATCH_SIZE" ]] && train_cmd+=(--batch-size "$TRAIN_BATCH_SIZE")
 [[ -n "$TRAIN_GRAD_ACCUM_STEPS" ]] && train_cmd+=(--grad-accum-steps "$TRAIN_GRAD_ACCUM_STEPS")

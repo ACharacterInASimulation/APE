@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from ape.scratchpad.modeling import (  # noqa: E402
     initialize_trainable_token_embeddings_from_text,
     install_trainable_token_embeddings,
     load_causal_lm,
+    load_scratchpad_state,
     load_tokenizer,
     save_scratchpad_state,
     trainable_parameter_count,
@@ -54,6 +56,45 @@ def cfg_get(config: dict[str, Any], dotted: str, default: Any = None) -> Any:
             return default
         cur = cur[part]
     return cur
+
+
+def checkpoint_step(path: Path) -> int:
+    try:
+        return int(path.name.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def is_complete_checkpoint(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and (path / "trainer_state.json").exists()
+        and (path / "optimizer.pt").exists()
+        and (path / "scheduler.pt").exists()
+        and (path / "scratchpad_embeddings.pt").exists()
+    )
+
+
+def resolve_resume_checkpoint(value: str | None, output_dir: str | Path) -> str | None:
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if key in {"", "none", "false", "0"}:
+        return None
+    if key in {"last", "true", "1", "yes"}:
+        candidates = sorted(Path(output_dir).glob("checkpoint-*"), key=checkpoint_step)
+        complete = [path for path in candidates if is_complete_checkpoint(path)]
+        if not complete:
+            raise ValueError(f"no complete checkpoint found under {output_dir}")
+        return str(complete[-1])
+    path = Path(value)
+    if not is_complete_checkpoint(path):
+        raise ValueError(
+            f"resume checkpoint is incomplete: {path}. "
+            "Expected trainer_state.json, optimizer.pt, scheduler.pt, and scratchpad_embeddings.pt. "
+            "Do not resume from a partial checkpoint that only has adapter_model.safetensors."
+        )
+    return str(path)
 
 
 class ScratchpadSFTDataset(Dataset):
@@ -166,6 +207,32 @@ class ScratchpadLrTrainer(Trainer):
         self.optimizer = optimizer_cls(grouped, **optimizer_kwargs)
         return self.optimizer
 
+    def _save(self, output_dir: str | None = None, state_dict: dict[str, Any] | None = None) -> None:
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        model_to_save = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        try:
+            from peft import PeftModel
+        except ImportError:
+            PeftModel = ()  # type: ignore[assignment]
+        if not isinstance(model_to_save, PeftModel):
+            return super()._save(output_dir, state_dict=state_dict)
+
+        os.makedirs(output_dir, exist_ok=True)
+        model_to_save.save_pretrained(
+            output_dir,
+            state_dict=state_dict,
+            save_embedding_layers=False,
+        )
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+        elif (
+            self.data_collator is not None
+            and hasattr(self.data_collator, "tokenizer")
+            and self.data_collator.tokenizer is not None
+        ):
+            self.data_collator.tokenizer.save_pretrained(output_dir)
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
 
 def make_training_arguments(**kwargs: Any) -> TrainingArguments:
     parameters = inspect.signature(TrainingArguments).parameters
@@ -206,6 +273,7 @@ def main() -> None:
     parser.add_argument("--train-jsonl", default=None)
     parser.add_argument("--eval-jsonl", default=None)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--resume-from-checkpoint", nargs="?", const="last", default=None)
     parser.add_argument("--scratchpad-len", type=int, default=None)
     parser.add_argument("--max-seq-len", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
@@ -234,6 +302,7 @@ def main() -> None:
 
     model_name = args.model or str(cfg_get(config, "model.name_or_path", "Qwen/Qwen3-1.7B"))
     output_dir = args.output_dir or str(cfg_get(config, "output_dir", "outputs/scratchpad_qwen3_1_7b"))
+    resume_from_checkpoint = resolve_resume_checkpoint(args.resume_from_checkpoint, output_dir)
     train_jsonl = args.train_jsonl or str(cfg_get(config, "data.train_jsonl", "data/scratchpad_multihop/train.jsonl"))
     eval_jsonl = args.eval_jsonl or cfg_get(config, "data.eval_jsonl", "data/scratchpad_multihop/eval.jsonl")
     scratchpad_len = args.scratchpad_len or int(cfg_get(config, "scratchpad.length", DEFAULT_SCRATCHPAD_LEN))
@@ -295,6 +364,9 @@ def main() -> None:
         print(f"initialized scratchpad embeddings from {scratchpad_init_text!r} token ids {init_token_ids}")
     else:
         print("initialized scratchpad embeddings from resized special-token rows")
+    if resume_from_checkpoint:
+        load_scratchpad_state(model, tokenizer, resume_from_checkpoint)
+        print(f"loaded scratchpad embeddings from resume checkpoint: {resume_from_checkpoint}")
 
     if bool(cfg_get(config, "train.gradient_checkpointing", True)):
         model.gradient_checkpointing_enable()
@@ -378,7 +450,7 @@ def main() -> None:
         callbacks=[SaveScratchpadCallback(tokenizer, scratchpad_tokens)],
         scratchpad_learning_rate=scratchpad_learning_rate,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
     save_scratchpad_state(model, tokenizer, output_dir, scratchpad_tokens)
